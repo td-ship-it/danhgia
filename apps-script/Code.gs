@@ -50,7 +50,7 @@ const LOGIN_BLOCK_SEC = 15 * 60;       // ... thì khóa 15 phút
 // OTP qua email cho Trưởng đơn vị / HR
 const OTP_TTL_SEC        = 5 * 60;     // mã có hiệu lực 5 phút
 const OTP_MAX_ATTEMPTS   = 5;          // nhập sai 5 lần → phải đăng nhập lại
-const OTP_RESEND_COOLDOWN = 60;        // gửi lại mã sau tối thiểu 60 giây
+const OTP_RESEND_COOLDOWN = 120;       // gửi lại mã sau tối thiểu 120 giây
 const OTP_MAX_RESEND     = 3;          // mỗi lượt đăng nhập gửi lại tối đa 3 lần
 const OTP_MAX_PER_USER   = 6;          // mỗi người tối đa 6 email OTP / 15 phút (chống spam hộp thư)
 const PRIVILEGED_ROLES   = ["manager", "hr"];

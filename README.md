@@ -87,7 +87,7 @@ npx wrangler dev
 
 Người có vai trò **Trưởng đơn vị** hoặc **HR** (ở bất kỳ đơn vị nào) sau khi nhập mã số/CCCD sẽ nhận **mã OTP 6 số qua email**. Nhập đúng mã mới vào được hệ thống. VC-NLĐ thường vẫn chỉ cần mã số.
 
-- Mã hiệu lực 5 phút, dùng 1 lần; sai 5 lần phải đăng nhập lại; gửi lại mã sau 60 giây (tối đa 3 lần).
+- Mã hiệu lực 5 phút, dùng 1 lần; sai 5 lần phải đăng nhập lại; gửi lại mã sau 120 giây (tối đa 3 lần).
 - Mỗi tài khoản tối đa 6 email OTP / 15 phút (chống spam hộp thư).
 - Email OTP ghi rõ thời gian, thiết bị, IP, vị trí. Nếu Trưởng đơn vị nhận email mà không phải mình đăng nhập thì biết ngay có người dùng trộm CCCD.
 - Phiên đăng nhập cũ của Trưởng đơn vị/HR (cấp trước khi bật OTP) tự bị từ chối, buộc đăng nhập lại.
