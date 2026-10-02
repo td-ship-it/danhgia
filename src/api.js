@@ -52,6 +52,20 @@ export async function handleApi(request, env) {
     clientIp: request.headers.get("CF-Connecting-IP") || "",
   };
 
+  // Thông tin mạng / vị trí do Cloudflare cung cấp — chỉ gửi kèm khi đăng nhập để ghi lịch sử
+  if (body.action === "login" || body.action === "verifyOtp" || body.action === "resendOtp") {
+    const cf = request.cf || {};
+    payload.client = {
+      userAgent: (request.headers.get("User-Agent") || "").slice(0, 500),
+      acceptLanguage: (request.headers.get("Accept-Language") || "").slice(0, 100),
+      country: cf.country || "",
+      region: cf.region || "",
+      city: cf.city || "",
+      asn: cf.asn || "",
+      asOrganization: cf.asOrganization || "",
+    };
+  }
+
   let upstream;
   try {
     // Apps Script trả 302 → googleusercontent.com; fetch tự theo redirect bằng GET (đúng như Apps Script yêu cầu)

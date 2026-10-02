@@ -9,6 +9,9 @@
  *   PROXY_KEY    : BẮT BUỘC — chuỗi bí mật, trùng với biến PROXY_KEY trên Cloudflare
  *   TOKEN_SECRET : tự sinh ở lần gọi đầu tiên nếu chưa có
  *
+ * Sheet DanhSachNhanSu cần cột "Email" cho Trưởng đơn vị và HR
+ * (dùng để gửi mã OTP khi đăng nhập).
+ *
  * Cột sheet DuLieuDanhGia:
  *   A ThoiGian | B ThangDanhGia (MM-YYYY, text) | C HoTen | D DonVi
  *   E-G 1.1-1.3 | H-R 11 điểm thành phần | S Tổng | T Xếp loại | U Ghi chú A+
@@ -44,6 +47,14 @@ const TOKEN_TTL_SEC   = 8 * 60 * 60;   // phiên đăng nhập 8 giờ
 const LOGIN_MAX_FAIL  = 10;            // sai quá 10 lần / IP ...
 const LOGIN_BLOCK_SEC = 15 * 60;       // ... thì khóa 15 phút
 
+// OTP qua email cho Trưởng đơn vị / HR
+const OTP_TTL_SEC        = 5 * 60;     // mã có hiệu lực 5 phút
+const OTP_MAX_ATTEMPTS   = 5;          // nhập sai 5 lần → phải đăng nhập lại
+const OTP_RESEND_COOLDOWN = 60;        // gửi lại mã sau tối thiểu 60 giây
+const OTP_MAX_RESEND     = 3;          // mỗi lượt đăng nhập gửi lại tối đa 3 lần
+const OTP_MAX_PER_USER   = 6;          // mỗi người tối đa 6 email OTP / 15 phút (chống spam hộp thư)
+const PRIVILEGED_ROLES   = ["manager", "hr"];
+
 const SCORE_RULES = {
   diem_2_1: { label: "2.1", allowed: [0, 3] },
   diem_2_2: { label: "2.2", allowed: [0, 1, 2, 3] },
@@ -70,6 +81,8 @@ const REPORT_HEADERS = [
 // auth: null = không cần đăng nhập | "any" = mọi vai trò | "manager" | "hr"
 const ROUTES = {
   login:                    { auth: null,      fn: login_ },
+  verifyOtp:                { auth: null,      fn: verifyOtp_ },
+  resendOtp:                { auth: null,      fn: resendOtp_ },
   checkDoubleEntry:         { auth: "any",     fn: checkDoubleEntry_ },
   saveData:                 { auth: "any",     fn: saveData_ },
   getUserHistory:           { auth: "any",     fn: getUserHistory_ },
@@ -119,17 +132,20 @@ function doPost(e) {
 
 // ============================================================
 // 1. ĐĂNG NHẬP
+//    VC-NLĐ: nhập mã số là vào.
+//    Trưởng đơn vị / HR: nhập mã số → hệ thống gửi OTP 6 số về email
+//    (cột "Email" trong DanhSachNhanSu) → nhập đúng OTP mới được cấp phiên.
 // ============================================================
 function login_(args, _user, req) {
   const msnv = str_(args.msnv);
-  const ip   = str_(req.clientIp);
+  const ctx  = clientCtx_(req, args);
   if (!msnv) throw appError_("Vui lòng nhập mã số", "BAD_INPUT");
-  checkRateLimit_(ip);
+  checkRateLimit_(ctx.ip);
 
   const matches = findStaff_(msnv);
   if (!matches.length) {
-    registerFail_(ip);
-    logLogin(msnv, "(Không tìm thấy)", "(Không tìm thấy)", "Không xác định", "❌ Sai mã số");
+    registerFail_(ctx.ip);
+    logLogin_(ctx, { msnv: msnv, hoTen: "(Không tìm thấy)", donVi: "(Không tìm thấy)", role: "" }, "❌ Sai mã số");
     throw appError_("Mã số không tồn tại!", "NOT_FOUND");
   }
 
@@ -151,15 +167,112 @@ function login_(args, _user, req) {
   }
 
   const user = { msnv: chosen.msnv, hoTen: chosen.hoTen, donVi: chosen.donVi, role: chosen.role };
-  const roleLabel = { hr: "Tổ chức cán bộ", manager: "Trưởng đơn vị", staff: "VC-NLĐ" }[user.role];
-  logLogin(msnv, user.hoTen, user.donVi, roleLabel, "✅ Thành công");
-  return { multiUnit: false, token: signToken_(user), user: user };
+
+  // Người có vai trò Trưởng đơn vị / HR ở BẤT KỲ đơn vị nào đều phải qua OTP,
+  // kể cả khi đang chọn vai trò VC-NLĐ.
+  const privileged = matches.some(m => PRIVILEGED_ROLES.indexOf(m.role) >= 0);
+  if (!privileged) {
+    logLogin_(ctx, user, "✅ Thành công");
+    return { multiUnit: false, token: signToken_(user, false), user: user };
+  }
+
+  const email = chosen.email || (matches.find(m => isEmail_(m.email)) || {}).email || "";
+  if (!isEmail_(email)) {
+    logLogin_(ctx, user, "⛔ Chưa có email nhận OTP");
+    throw appError_("Tài khoản của Quý Thầy/Cô chưa được khai báo email để nhận mã OTP. " +
+                    "Vui lòng liên hệ Phòng Tổ chức cán bộ để bổ sung.", "NO_EMAIL");
+  }
+
+  checkOtpQuota_(user.msnv);
+  const otpId = Utilities.getUuid().replace(/-/g, "");
+  const code  = newOtpCode_();
+  sendOtpEmail_(email, user, code, ctx);
+  putOtp_(otpId, {
+    user: user, email: email, hash: otpHash_(otpId, code),
+    exp: nowSec_() + OTP_TTL_SEC, sentAt: nowSec_(), attempts: 0, resends: 0, ip: ctx.ip
+  });
+  logLogin_(ctx, user, "📧 Đã gửi OTP", "Gửi tới " + maskEmail_(email), otpId);
+
+  return {
+    multiUnit: false, otpRequired: true, otpId: otpId,
+    maskedEmail: maskEmail_(email), expiresIn: OTP_TTL_SEC, resendAfter: OTP_RESEND_COOLDOWN
+  };
+}
+
+function verifyOtp_(args, _user, req) {
+  const ctx   = clientCtx_(req, args);
+  const otpId = str_(args.otpId);
+  const code  = str_(args.code).replace(/\s+/g, "");
+  checkRateLimit_(ctx.ip);
+  if (!/^[a-f0-9]{32}$/.test(otpId)) throw appError_("Phiên xác thực không hợp lệ, vui lòng đăng nhập lại", "OTP_EXPIRED");
+  if (!/^\d{6}$/.test(code)) throw appError_("Mã OTP gồm 6 chữ số", "BAD_INPUT");
+
+  return withLock_(() => {
+    const rec = getOtp_(otpId);
+    if (!rec) throw appError_("Mã OTP đã hết hạn, vui lòng đăng nhập lại", "OTP_EXPIRED");
+    const ipNote = rec.ip && ctx.ip && rec.ip !== ctx.ip ? "IP khác lúc gửi mã (" + rec.ip + ")" : "";
+
+    if (nowSec_() > rec.exp) {
+      delOtp_(otpId);
+      logLogin_(ctx, rec.user, "⌛ OTP hết hạn", ipNote, otpId);
+      throw appError_("Mã OTP đã hết hạn, vui lòng đăng nhập lại", "OTP_EXPIRED");
+    }
+
+    if (otpHash_(otpId, code) !== rec.hash) {
+      rec.attempts++;
+      registerFail_(ctx.ip);
+      const left = OTP_MAX_ATTEMPTS - rec.attempts;
+      if (left <= 0) {
+        delOtp_(otpId);
+        logLogin_(ctx, rec.user, "❌ Sai OTP quá số lần", ipNote, otpId);
+        throw appError_("Nhập sai mã OTP quá nhiều lần. Vui lòng đăng nhập lại.", "OTP_EXPIRED");
+      }
+      putOtp_(otpId, rec);
+      logLogin_(ctx, rec.user, "❌ Sai OTP", ["Còn " + left + " lần thử", ipNote].filter(Boolean).join(" · "), otpId);
+      throw appError_("Mã OTP không đúng. Còn " + left + " lần thử.", "OTP_WRONG");
+    }
+
+    delOtp_(otpId);
+    logLogin_(ctx, rec.user, "✅ Thành công (OTP)", ipNote, otpId);
+    return { token: signToken_(rec.user, true), user: rec.user };
+  });
+}
+
+function resendOtp_(args, _user, req) {
+  const ctx   = clientCtx_(req, args);
+  const otpId = str_(args.otpId);
+  checkRateLimit_(ctx.ip);
+  if (!/^[a-f0-9]{32}$/.test(otpId)) throw appError_("Phiên xác thực không hợp lệ, vui lòng đăng nhập lại", "OTP_EXPIRED");
+
+  return withLock_(() => {
+    const rec = getOtp_(otpId);
+    if (!rec) throw appError_("Phiên xác thực đã hết hạn, vui lòng đăng nhập lại", "OTP_EXPIRED");
+    const wait = OTP_RESEND_COOLDOWN - (nowSec_() - rec.sentAt);
+    if (wait > 0) throw appError_("Vui lòng đợi " + wait + " giây rồi gửi lại mã", "OTP_COOLDOWN");
+    if (rec.resends >= OTP_MAX_RESEND) {
+      delOtp_(otpId);
+      throw appError_("Đã gửi lại mã quá số lần cho phép. Vui lòng đăng nhập lại.", "OTP_EXPIRED");
+    }
+
+    checkOtpQuota_(rec.user.msnv);
+    const code = newOtpCode_();
+    sendOtpEmail_(rec.email, rec.user, code, ctx);
+    rec.hash     = otpHash_(otpId, code);
+    rec.exp      = nowSec_() + OTP_TTL_SEC;
+    rec.sentAt   = nowSec_();
+    rec.attempts = 0;
+    rec.resends++;
+    putOtp_(otpId, rec);
+    logLogin_(ctx, rec.user, "📧 Gửi lại OTP", "Lần " + rec.resends + " · tới " + maskEmail_(rec.email), otpId);
+    return { maskedEmail: maskEmail_(rec.email), expiresIn: OTP_TTL_SEC, resendAfter: OTP_RESEND_COOLDOWN };
+  });
 }
 
 function findStaff_(msnv) {
   const data = getSheet_(SHEET_NHANSU).getDataRange().getValues();
   const h  = data[0].map(str_);
   const iM = h.indexOf("MSNV"), iH = h.indexOf("HoTen"), iD = h.indexOf("DonVi"), iR = h.indexOf("TRUONG DON VI");
+  const iE = h.findIndex(x => /^(e-?mail|mail)\b/i.test(x));
   if (iM < 0 || iH < 0 || iD < 0)
     throw appError_("Sheet " + SHEET_NHANSU + " thiếu cột MSNV / HoTen / DonVi", "CONFIG");
 
@@ -167,11 +280,13 @@ function findStaff_(msnv) {
   for (let i = 1; i < data.length; i++) {
     if (!matchesId_(data[i][iM], msnv)) continue;
     const r = iR >= 0 ? str_(data[i][iR]).toLowerCase() : "";
+    const e = iE >= 0 ? str_(data[i][iE]).toLowerCase() : "";
     out.push({
       msnv:  str_(data[i][iM]),
       hoTen: str_(data[i][iH]),
       donVi: str_(data[i][iD]),
-      role:  r === "hr" ? "hr" : r === "x" ? "manager" : "staff"
+      role:  r === "hr" ? "hr" : r === "x" ? "manager" : "staff",
+      email: isEmail_(e) ? e : ""
     });
   }
   return out;
@@ -191,22 +306,235 @@ function registerFail_(ip) {
 }
 
 // ============================================================
+// OTP — lưu trong CacheService (tự hết hạn), chỉ lưu HMAC của mã
+// ============================================================
+function newOtpCode_() {
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,
+                                        Utilities.getUuid() + Utilities.getUuid() + Date.now());
+  let n = 0;
+  for (let i = 0; i < 6; i++) n = (n * 256 + (bytes[i] & 0xff)) % 1000000007;
+  return ("00000" + (n % 1000000)).slice(-6);
+}
+function otpHash_(otpId, code) { return sign_("otp:" + otpId + ":" + code); }
+function putOtp_(otpId, rec) {
+  CacheService.getScriptCache().put("otp_" + otpId, JSON.stringify(rec), OTP_TTL_SEC + 120);
+}
+function getOtp_(otpId) {
+  const s = CacheService.getScriptCache().get("otp_" + otpId);
+  if (!s) return null;
+  try { return JSON.parse(s); } catch (e) { return null; }
+}
+function delOtp_(otpId) { CacheService.getScriptCache().remove("otp_" + otpId); }
+
+function checkOtpQuota_(msnv) {
+  const cache = CacheService.getScriptCache();
+  const key = "otpq_" + normalizeId_(msnv);
+  const n = Number(cache.get(key) || 0);
+  if (n >= OTP_MAX_PER_USER)
+    throw appError_("Đã gửi quá nhiều mã OTP cho tài khoản này. Vui lòng thử lại sau 15 phút.", "RATE_LIMIT");
+  cache.put(key, String(n + 1), LOGIN_BLOCK_SEC);
+}
+
+function sendOtpEmail_(email, user, code, ctx) {
+  const when = Utilities.formatDate(new Date(), TZ, "HH:mm:ss dd/MM/yyyy");
+  const rows = [
+    ["Thời gian", when],
+    ["Thiết bị", [ctx.deviceName, ctx.browser].filter(Boolean).join(" · ")],
+    ["Địa chỉ IP", ctx.ip],
+    ["Vị trí (ước tính)", ctx.location]
+  ].filter(r => r[1]);
+  const table = rows.map(r =>
+    '<tr><td style="padding:4px 12px 4px 0;color:#64748b;">' + htmlEsc_(r[0]) + '</td>' +
+    '<td style="padding:4px 0;color:#0f172a;">' + htmlEsc_(r[1]) + '</td></tr>').join("");
+  const mins = Math.round(OTP_TTL_SEC / 60);
+
+  const html =
+    '<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;color:#0f172a;">' +
+      '<h2 style="color:#0f2557;font-size:18px;">Mã xác thực đăng nhập</h2>' +
+      '<p>Kính gửi Quý Thầy/Cô <b>' + htmlEsc_(user.hoTen) + '</b>,</p>' +
+      '<p>Mã OTP để đăng nhập Hệ thống tự đánh giá VC-NLĐ là:</p>' +
+      '<div style="font-size:32px;font-weight:bold;letter-spacing:8px;background:#f1f5f9;' +
+           'border-radius:10px;padding:16px;text-align:center;color:#0f2557;">' + code + '</div>' +
+      '<p style="font-size:13px;color:#475569;">Mã có hiệu lực trong ' + mins + ' phút và chỉ dùng được một lần. ' +
+         'Tuyệt đối không cung cấp mã này cho bất kỳ ai.</p>' +
+      '<table style="font-size:13px;margin:12px 0;">' + table + '</table>' +
+      '<p style="font-size:13px;background:#fef2f2;border-left:4px solid #dc2626;padding:10px 12px;color:#991b1b;">' +
+         '<b>Nếu Quý Thầy/Cô không thực hiện đăng nhập này</b>, có người đang dùng mã số/CCCD của Quý Thầy/Cô. ' +
+         'Vui lòng bỏ qua email và báo ngay cho Phòng Tổ chức cán bộ.</p>' +
+    '</div>';
+  const text =
+    "Ma OTP dang nhap He thong tu danh gia VC-NLD: " + code + "\n" +
+    "Hieu luc " + mins + " phut. Khong cung cap ma cho bat ky ai.\n" +
+    rows.map(r => r[0] + ": " + r[1]).join("\n") + "\n" +
+    "Neu khong phai Quy Thay/Co dang nhap, vui long bao ngay cho Phong To chuc can bo.";
+
+  try {
+    MailApp.sendEmail({
+      to: email,
+      subject: "[VC-NLĐ] Mã xác thực đăng nhập",
+      name: "Hệ thống đánh giá VC-NLĐ",
+      htmlBody: html,
+      body: text
+    });
+  } catch (e) {
+    console.error("Lỗi gửi OTP: " + e);
+    throw appError_("Không gửi được email OTP. Vui lòng thử lại sau ít phút hoặc liên hệ Phòng Tổ chức cán bộ.", "MAIL");
+  }
+}
+
+function maskEmail_(email) {
+  const p = str_(email).split("@");
+  if (p.length !== 2) return "";
+  const name = p[0];
+  const shown = name.length <= 2 ? name.charAt(0) : name.slice(0, 2);
+  return shown + "***" + (name.length > 4 ? name.slice(-1) : "") + "@" + p[1];
+}
+function isEmail_(v) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(str_(v)); }
+function nowSec_() { return Math.floor(Date.now() / 1000); }
+
+function withLock_(fn) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) throw appError_("Hệ thống đang bận, vui lòng thử lại", "BUSY");
+  try { return fn(); } finally { lock.releaseLock(); }
+}
+
+// ============================================================
+// THÔNG TIN THIẾT BỊ / MẠNG CỦA NGƯỜI ĐĂNG NHẬP
+//   req.clientIp, req.client : do Cloudflare Worker gắn vào (tin cậy)
+//   args.device              : do trình duyệt tự khai (chỉ dùng để ghi log)
+// ============================================================
+function clientCtx_(req, args) {
+  const c  = (req && req.client && typeof req.client === "object") ? req.client : {};
+  const d  = (args && args.device && typeof args.device === "object") ? args.device : {};
+  const ua = clip_(c.userAgent || d.ua, 500);
+  const p  = parseUA_(ua);
+
+  // Client Hints (Chrome/Edge/Cốc Cốc trên Android, Windows…) cho tên máy & phiên bản thật
+  const hintModel = clip_(d.model, 60);
+  const hintPlat  = clip_(d.platform, 30);
+  const hintVer   = clip_(d.platformVersion, 30);
+  if (hintModel) p.model = hintModel;
+  if (hintPlat === "Windows" && hintVer) p.osVer = Number(hintVer.split(".")[0]) >= 13 ? "11" : "10";
+  else if (hintPlat === "Android" && hintVer) p.osVer = hintVer;
+  else if (hintPlat === "macOS" && hintVer) p.osVer = hintVer;
+  // iPad đời mới giả làm Mac → nhận biết qua màn hình cảm ứng
+  if (p.os === "macOS" && Number(d.touchPoints) > 1) { p.os = "iPadOS"; p.type = "Máy tính bảng"; p.model = "iPad"; }
+
+  const vendor = vendorOf_(p.model);
+  let deviceName;
+  if (p.model) deviceName = (vendor && p.model.toLowerCase().indexOf(vendor.toLowerCase()) !== 0 ? vendor + " " : "") + p.model;
+  else deviceName = [p.type, p.os].filter(Boolean).join(" ");
+
+  return {
+    ip:         str_(req && req.clientIp),
+    location:   [clip_(c.city, 60), clip_(c.region, 60), clip_(c.country, 10)].filter(Boolean).join(", "),
+    isp:        [clip_(c.asOrganization, 80), c.asn ? "AS" + clip_(c.asn, 12) : ""].filter(Boolean).join(" · "),
+    deviceName: deviceName,
+    deviceType: p.type,
+    os:         [p.os, p.osVer].filter(Boolean).join(" "),
+    browser:    [p.browser, p.browserVer].filter(Boolean).join(" "),
+    screen:     clip_(d.screen, 30),
+    lang:       clip_(d.lang, 40) || clip_(String(c.acceptLanguage || "").split(",")[0], 40),
+    tz:         clip_(d.tz, 50),
+    ua:         ua
+  };
+}
+
+function parseUA_(ua) {
+  const r = { os: "", osVer: "", browser: "", browserVer: "", type: "", model: "" };
+  if (!ua) return r;
+  let m;
+  if ((m = ua.match(/Windows NT ([\d.]+)/))) {
+    r.os = "Windows"; r.type = "Máy tính";
+    r.osVer = { "10.0": "10/11", "6.3": "8.1", "6.2": "8", "6.1": "7" }[m[1]] || m[1];
+  } else if ((m = ua.match(/Android ([\d.]+)/))) {
+    r.os = "Android"; r.osVer = m[1];
+    r.type = /Mobile/.test(ua) ? "Điện thoại" : "Máy tính bảng";
+    const mm = ua.match(/Android [\d.]+;(?:\s*[a-z]{2}[-_][a-z]{2};)?\s*([^;)]+)/i);
+    const model = mm ? mm[1].replace(/\s*Build\/.*$/i, "").trim() : "";
+    if (model && model !== "K" && !/^(wv|Linux|Mobile)$/i.test(model)) r.model = model;
+  } else if ((m = ua.match(/(iPhone|iPad|iPod)[^)]*? OS ([\d_]+)/))) {
+    r.os = m[1] === "iPad" ? "iPadOS" : "iOS"; r.osVer = m[2].replace(/_/g, ".");
+    r.type = m[1] === "iPad" ? "Máy tính bảng" : "Điện thoại"; r.model = m[1];
+  } else if ((m = ua.match(/Mac OS X ([\d_.]+)/))) {
+    r.os = "macOS"; r.osVer = m[1].replace(/_/g, "."); r.type = "Máy tính";
+  } else if (/CrOS/.test(ua)) { r.os = "ChromeOS"; r.type = "Máy tính"; }
+  else if (/Linux/.test(ua))  { r.os = "Linux";    r.type = "Máy tính"; }
+
+  const browsers = [
+    ["Zalo",             /Zalo(?:App|Theme)?\/?([\d.]*)/],
+    ["Facebook",         /FB(?:AV|_IAB)\/([\d.]+)/],
+    ["Messenger",        /Messenger\/?([\d.]*)/],
+    ["Cốc Cốc",          /coc_coc_browser\/([\d.]+)/],
+    ["Edge",             /Edg(?:e|A|iOS)?\/([\d.]+)/],
+    ["Opera",            /(?:OPR|OPT)\/([\d.]+)/],
+    ["Samsung Internet", /SamsungBrowser\/([\d.]+)/],
+    ["Firefox",          /(?:Firefox|FxiOS)\/([\d.]+)/],
+    ["Chrome",           /(?:Chrome|CriOS)\/([\d.]+)/],
+    ["Safari",           /Version\/([\d.]+).*Safari/]
+  ];
+  for (let i = 0; i < browsers.length; i++) {
+    const b = ua.match(browsers[i][1]);
+    if (b) { r.browser = browsers[i][0]; r.browserVer = (b[1] || "").split(".")[0]; break; }
+  }
+  return r;
+}
+
+function vendorOf_(model) {
+  const s = str_(model);
+  if (!s) return "";
+  const rules = [
+    [/^(iPhone|iPad|iPod)/i, "Apple"], [/^(SM-|Galaxy)/i, "Samsung"], [/^(CPH|OPPO|PH[A-Z]M)/i, "OPPO"],
+    [/^RMX/i, "Realme"], [/^(V\d{4}|vivo)/i, "vivo"], [/^(Redmi|POCO|Mi |M\d{4}|2\d{3}[A-Z0-9]{4,})/i, "Xiaomi"],
+    [/^(Pixel)/i, "Google"], [/^(Nokia|TA-)/i, "Nokia"], [/^(ASUS|ZS|AI\d)/i, "ASUS"],
+    [/^(Infinix|X\d{3,4}[A-Z]?$)/i, "Infinix"], [/^(TECNO)/i, "TECNO"], [/^(moto|XT\d)/i, "Motorola"],
+    [/^(HUAWEI|[A-Z]{3}-[A-Z]{1,2}\d)/i, "Huawei"], [/^(Vsmart)/i, "Vsmart"]
+  ];
+  for (let i = 0; i < rules.length; i++) if (rules[i][0].test(s)) return rules[i][1];
+  return "";
+}
+
+function clip_(v, n) { return str_(v).replace(/[\u0000-\u001f]/g, " ").slice(0, n); }
+function htmlEsc_(v) {
+  return str_(v).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+// Chặn chèn công thức vào Sheets (giá trị bắt đầu bằng = + - @)
+function safeCell_(v) { const s = str_(v); return /^[=+\-@]/.test(s) ? "'" + s : s; }
+
+// ============================================================
 // GHI LOG ĐĂNG NHẬP
 // ============================================================
-function logLogin(msnv, hoTen, donVi, role, status) {
+const LOGIN_HEADERS = [
+  "Thời gian", "MSNV/CCCD", "Họ tên", "Đơn vị", "Vai trò", "Trạng thái", "Chi tiết",
+  "IP", "Vị trí (ước tính)", "Nhà mạng", "Tên thiết bị", "Loại thiết bị", "Hệ điều hành",
+  "Trình duyệt", "Màn hình", "Ngôn ngữ", "Múi giờ", "User-Agent", "Mã phiên"
+];
+
+function logLogin_(ctx, user, status, detail, sessionId) {
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     let sheet = ss.getSheetByName(SHEET_LOGIN);
-    if (!sheet) {
-      sheet = ss.insertSheet(SHEET_LOGIN);
-      const h = ["Thời gian", "MSNV/CCCD", "Họ tên", "Đơn vị", "Vai trò", "Trạng thái"];
-      sheet.appendRow(h);
-      sheet.getRange(1, 1, 1, h.length).setBackground("#0f2557").setFontColor("white").setFontWeight("bold");
-      sheet.setFrozenRows(1);
-      sheet.setColumnWidths(1, h.length, 150);
-    }
-    sheet.appendRow([new Date(), "'" + msnv, hoTen, donVi, role, status]);
+    if (!sheet) sheet = ss.insertSheet(SHEET_LOGIN);
+    ensureLoginHeader_(sheet);
+
+    const roleLabel = { hr: "Tổ chức cán bộ", manager: "Trưởng đơn vị", staff: "VC-NLĐ" }[user.role] || "Không xác định";
+    sheet.appendRow([
+      new Date(), "'" + str_(user.msnv), safeCell_(user.hoTen), safeCell_(user.donVi), roleLabel,
+      status, safeCell_(detail), safeCell_(ctx.ip), safeCell_(ctx.location), safeCell_(ctx.isp),
+      safeCell_(ctx.deviceName), safeCell_(ctx.deviceType), safeCell_(ctx.os), safeCell_(ctx.browser),
+      safeCell_(ctx.screen), safeCell_(ctx.lang), safeCell_(ctx.tz), safeCell_(ctx.ua),
+      sessionId ? String(sessionId).slice(0, 8) : ""
+    ]);
   } catch (e) { console.error("Lỗi log: " + e); }
+}
+
+function ensureLoginHeader_(sheet) {
+  const range = sheet.getRange(1, 1, 1, LOGIN_HEADERS.length);
+  const cur = range.getValues()[0].map(str_);
+  if (cur.join("|") === LOGIN_HEADERS.join("|")) return;
+  range.setValues([LOGIN_HEADERS])
+       .setBackground("#0f2557").setFontColor("white").setFontWeight("bold");
+  sheet.setFrozenRows(1);
 }
 
 // ============================================================
@@ -502,9 +830,10 @@ function sign_(body) {
   return Utilities.base64EncodeWebSafe(Utilities.computeHmacSha256Signature(body, getSecret_()));
 }
 
-function signToken_(user) {
+function signToken_(user, mfa) {
   const payload = {
     msnv: user.msnv, hoTen: user.hoTen, donVi: user.donVi, role: user.role,
+    mfa: mfa ? 1 : 0,
     exp: Math.floor(Date.now() / 1000) + TOKEN_TTL_SEC
   };
   const body = Utilities.base64EncodeWebSafe(JSON.stringify(payload), Utilities.Charset.UTF_8);
@@ -522,6 +851,9 @@ function verifyToken_(token) {
   } catch (e) { throw invalid(); }
   if (!payload.exp || payload.exp < Math.floor(Date.now() / 1000))
     throw appError_("Phiên đăng nhập đã hết hạn, vui lòng đăng nhập lại", "AUTH");
+  // Phiên Trưởng đơn vị / HR bắt buộc đã xác thực OTP (phiên cũ trước khi bật OTP bị từ chối)
+  if (PRIVILEGED_ROLES.indexOf(payload.role) >= 0 && payload.mfa !== 1)
+    throw appError_("Hệ thống đã bật xác thực OTP, vui lòng đăng nhập lại", "AUTH");
   return payload;
 }
 
@@ -748,4 +1080,35 @@ function migrateAddThangDanhGiaColumn() {
   rg.setNumberFormat("@");
   rg.setValues(values);
   notify_("✅ Migration hoàn tất! Đã điền " + values.length + " dòng. Kiểm tra và chỉnh tay nếu cần.");
+}
+
+/**
+ * CHẠY 1 LẦN sau khi cập nhật code: cấp quyền gửi email cho script
+ * và gửi thử một email OTP mẫu tới chính tài khoản Google đang chạy script.
+ */
+function testOtpEmail() {
+  const me = Session.getEffectiveUser().getEmail();
+  sendOtpEmail_(me, { hoTen: "Quản trị hệ thống" }, "123456",
+                { deviceName: "Email thử nghiệm", browser: "", ip: "", location: "" });
+  notify_("✅ Đã gửi email thử tới " + me + ". Hạn mức gửi còn lại hôm nay: " + MailApp.getRemainingDailyQuota());
+}
+
+/**
+ * Kiểm tra Trưởng đơn vị / HR nào chưa có email trong DanhSachNhanSu
+ * (những người này sẽ KHÔNG đăng nhập được cho tới khi bổ sung email).
+ */
+function checkMissingEmails() {
+  const data = getSheet_(SHEET_NHANSU).getDataRange().getValues();
+  const h  = data[0].map(str_);
+  const iM = h.indexOf("MSNV"), iH = h.indexOf("HoTen"), iD = h.indexOf("DonVi"), iR = h.indexOf("TRUONG DON VI");
+  const iE = h.findIndex(x => /^(e-?mail|mail)\b/i.test(x));
+  if (iE < 0) { notify_("❌ Sheet " + SHEET_NHANSU + " chưa có cột Email. Thêm một cột tiêu đề \"Email\" rồi chạy lại."); return; }
+  const missing = [];
+  for (let i = 1; i < data.length; i++) {
+    const r = iR >= 0 ? str_(data[i][iR]).toLowerCase() : "";
+    if ((r === "x" || r === "hr") && !isEmail_(data[i][iE]))
+      missing.push("Dòng " + (i + 1) + ": " + str_(data[i][iH]) + " — " + str_(data[i][iD]) + " (" + str_(data[i][iM]) + ")");
+  }
+  notify_(missing.length ? "⚠️ " + missing.length + " người chưa có email hợp lệ:\n" + missing.join("\n")
+                         : "✅ Tất cả Trưởng đơn vị / HR đều đã có email.");
 }

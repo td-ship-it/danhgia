@@ -83,6 +83,37 @@ npx wrangler dev
 
 ---
 
+## Đăng nhập 2 lớp (OTP qua email) cho Trưởng đơn vị & HR
+
+Người có vai trò **Trưởng đơn vị** hoặc **HR** (ở bất kỳ đơn vị nào) sau khi nhập mã số/CCCD sẽ nhận **mã OTP 6 số qua email**. Nhập đúng mã mới vào được hệ thống. VC-NLĐ thường vẫn chỉ cần mã số.
+
+- Mã hiệu lực 5 phút, dùng 1 lần; sai 5 lần phải đăng nhập lại; gửi lại mã sau 60 giây (tối đa 3 lần).
+- Mỗi tài khoản tối đa 6 email OTP / 15 phút (chống spam hộp thư).
+- Email OTP ghi rõ thời gian, thiết bị, IP, vị trí. Nếu Trưởng đơn vị nhận email mà không phải mình đăng nhập thì biết ngay có người dùng trộm CCCD.
+- Phiên đăng nhập cũ của Trưởng đơn vị/HR (cấp trước khi bật OTP) tự bị từ chối, buộc đăng nhập lại.
+
+**Cài đặt (làm 1 lần):**
+
+1. Sheet `DanhSachNhanSu`: thêm cột tiêu đề **`Email`**, điền email cho mọi dòng có `TRUONG DON VI` = `x` hoặc `hr`. *Ai chưa có email sẽ không đăng nhập được.*
+2. Dán `apps-script/Code.gs` mới vào Apps Script.
+3. Chạy hàm **`testOtpEmail`** (▶ Run) → cấp quyền **gửi email** khi được hỏi → kiểm tra hộp thư của chính mình.
+4. Chạy hàm **`checkMissingEmails`** để xem còn ai thiếu email.
+5. **Deploy → Manage deployments → ✏️ Edit → Version: New version → Deploy.**
+6. Push code lên GitHub để Cloudflare triển khai lại `public/index.html` và `src/api.js`.
+
+> Email gửi từ tài khoản Google đang sở hữu script. Hạn mức: tài khoản Gmail thường ~100 email/ngày, Google Workspace ~1.500 email/ngày.
+
+### Lịch sử đăng nhập (sheet `LichSuDangNhap`)
+
+Mỗi lần đăng nhập, sai mã, gửi/gửi lại OTP, sai OTP… đều được ghi với các cột:
+
+`Thời gian · MSNV/CCCD · Họ tên · Đơn vị · Vai trò · Trạng thái · Chi tiết · IP · Vị trí (ước tính) · Nhà mạng · Tên thiết bị · Loại thiết bị · Hệ điều hành · Trình duyệt · Màn hình · Ngôn ngữ · Múi giờ · User-Agent · Mã phiên`
+
+- *Mã phiên* giống nhau ở các dòng "Đã gửi OTP" → "Sai OTP" → "Thành công (OTP)" của cùng một lượt đăng nhập.
+- *Tên thiết bị*: Android dùng Chrome/Edge/Cốc Cốc/Zalo thường hiện đúng mã máy (vd. `Samsung SM-S918B`). iPhone/iPad chỉ hiện `iPhone`/`iPad`; máy tính chỉ hiện hệ điều hành. Trình duyệt không cho web đọc tên máy tính do người dùng đặt.
+- *Vị trí* ước tính theo IP (cấp thành phố), do Cloudflare cung cấp.
+- Hàng tiêu đề cũ (6 cột) tự được mở rộng ở lần ghi đầu tiên; dữ liệu cũ giữ nguyên.
+
 ## Thay đổi so với bản cũ
 
 **Chọn tháng**
