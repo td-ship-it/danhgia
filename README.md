@@ -83,6 +83,43 @@ npx wrangler dev
 
 ---
 
+## Phiếu đánh giá mới (từ tháng 10/2026) — mẫu chính thức
+
+Từ **tháng đánh giá 10/2026** app dùng phiếu *"Tiêu chí đánh giá hiệu quả công việc hàng tháng đối với VC, NLĐ khối hành chính, hỗ trợ, phục vụ"* (mẫu chính thức). Các tháng trước vẫn dùng phiếu cũ (ai nộp bù tháng 9 vẫn ra phiếu cũ). Mốc này nằm ở `FORM_V2_FROM` trong `apps-script/Code.gs` **và** `public/index.html` — đổi thì đổi cả hai.
+
+- **Nội dung tiêu chí ghi nguyên văn** theo mẫu chính thức.
+- **Chấm đúng chỗ phiếu ghi điểm, mọi mục bước 0,5** (từ 0 đến điểm tối đa của mục):
+  - 1.1 – 1.5: mỗi tiêu chí 0 → 2 (khoản trừ của 1.4 trừ vào 2 điểm của 1.4)
+  - 2.1: 3 ý × (0 → 1) · 2.2: ý "thường xuyên" 0 → 2 + ý "đột xuất" 0 → 1 · 2.3: 2 ý × (0 → 1) · 2.4: 2 ý × (0 → 1)
+  - 3.1 (0 → 4), 3.2 (0 → 3), 3.3 (0 → 3) — ai cũng tự chấm 3.3
+  - Phần II giữ nguyên, mỗi mức có ghi kèm % tương ứng
+- **Điểm thưởng:** tối đa đủ 7 điểm (Phòng TCCB chốt không áp giới hạn 10% KPI; dòng ghi chú trên phiếu vẫn giữ nguyên văn). Đề xuất > 0 thì bắt buộc mô tả cách làm hay & minh chứng. Tổng sau cộng tối đa 100.
+- **Xếp loại chỉ theo tổng điểm** (đã cộng thưởng, tối đa 100): A+ ≥ 90 · A 70–<90 · B 50–<70 · C < 50. Không hạ xếp loại theo điểm phần II. Đạt A+ thì **bắt buộc ghi căn cứ xác nhận vượt mức**. Cột *Ghi chú xếp loại* trong sheet được giữ để không lệch cấu trúc, nay luôn để trống.
+- **Ô ghi chú** (mô tả thưởng, căn cứ vượt mức) tối đa **100 từ**, có bộ đếm.
+- **Trưởng đơn vị** nhập *Thưởng công nhận* (0 → mức đề xuất; để trống = công nhận đúng đề xuất); Điểm TĐV và xếp loại tự tính lại, vẫn sửa tay được.
+- **Dữ liệu** lưu ở sheet `DuLieuDanhGia_KPI` (tự tạo khi có phiếu đầu tiên); sheet `DuLieuDanhGia` cũ giữ nguyên. Lịch sử cá nhân hiện cả hai; báo cáo/xuất Excel/CSV tháng nào theo mẫu tháng đó. (Sheet `DuLieuDanhGia_V2` nếu có là dữ liệu thử của bản nháp — xóa được.)
+
+## Bảng tổng hợp chi thu nhập tăng thêm (HR)
+
+Trang **Dashboard** của HR có nút **🏛️ Bảng tổng hợp chi thu nhập tăng thêm (mẫu TCCB, .xlsx)**: chọn tháng → bấm nút → chọn phạm vi, ngày lập, tên người ký → tải file Excel **đúng mẫu** "Kết quả đánh giá T9.2026" (quốc hiệu, tiêu đề theo tháng, 14 cột, nhóm theo Đơn vị, khối chữ ký, khổ ngang A4, lặp tiêu đề cột khi in).
+
+- **Danh sách:** mặc định *Mức A* = người được Trưởng đơn vị xếp **A+ hoặc A**; hoặc chọn *Tất cả người đã nộp*. Phiếu chưa được TĐV đánh giá không vào danh sách mức A (có thông báo số lượng).
+- **Nguồn cột:** Chức danh ← cột `CD/CV`, Bộ môn ← cột `DonVi`, Đơn vị ← cột `ĐƠN VỊ` của `DanhSachNhanSu`; *Hiệu trưởng phê duyệt* điền sẵn bằng xếp loại của TĐV (sửa tay trong file nếu khác). *Ý kiến của cá nhân* = căn cứ vượt mức (A+) và mô tả cách làm hay (nếu có đề xuất thưởng).
+- **Khối chữ ký:** mỗi người ký (Người lập bảng · Phòng TCCB · Hiệu trưởng) có ô chọn — bỏ chọn thì khối đó (chức danh + họ tên) không in ra file; bỏ cả ba thì file không có phần chữ ký.
+- File được tạo ngay trên trình duyệt (thư viện ExcelJS tải từ CDN khi bấm nút); tên người ký và các ô chọn được nhớ cho lần sau.
+
+## Người làm việc ở nhiều đơn vị
+
+- Mỗi **đơn vị đánh giá riêng**: kiểm tra "đã gửi" theo *mã số + đơn vị + tháng* (gửi ở đơn vị A vẫn gửi được ở đơn vị B; gửi lại ở A thì bị chặn). Lịch sử cá nhân hiện cả hai đơn vị.
+- Nút **🔄 Chuyển đơn vị** (trên menu trái và cạnh dòng "Đơn vị" ở trang Tự đánh giá) — chỉ hiện với người có từ 2 đơn vị/vai trò trở lên. Chuyển không cần đăng xuất; đã xác thực OTP lúc đăng nhập thì không phải nhập lại. Mỗi lần chuyển được ghi vào `LichSuDangNhap` (trạng thái "🔄 Chuyển đơn vị").
+
+## Tốc độ
+
+- **Đọc ít dữ liệu:** backend dùng *TextFinder* của Sheets để tìm đúng dòng cần (theo MSNV, theo tháng) thay vì đọc cả sheet — đăng nhập, kiểm tra đã nộp, lịch sử, bảng Trưởng đơn vị, dashboard HR đều chỉ đọc phần liên quan. Lưu bảng chấm ghi một lần cho cả nhóm dòng.
+- **Ít lần gọi máy chủ:** sau đăng nhập trang tải trước lịch sử cá nhân → chọn tháng hiện kết quả ngay; Trưởng đơn vị chọn tháng là dữ liệu đơn vị được tải trước, bảng chấm và thống kê dùng chung.
+- **Giữ Apps Script "ấm":** `wrangler.toml` có `[triggers] crons` — Cloudflare gọi nhẹ Apps Script 5 phút/lần trong 7h–19h (giờ VN) để tránh phải chờ Google khởi động lại. Có thể chỉnh giờ trong `crons` (giờ UTC).
+- Phần chậm còn lại chủ yếu là thời gian Google chạy Apps Script (~1–2 giây/lần) và gửi email OTP (~1–2 giây) — không rút ngắn thêm được bằng code.
+
 ## Đăng nhập 2 lớp (OTP qua email) cho Trưởng đơn vị & HR
 
 Người có vai trò **Trưởng đơn vị** hoặc **HR** (ở bất kỳ đơn vị nào) sau khi nhập mã số/CCCD sẽ nhận **mã OTP 6 số qua email**. Nhập đúng mã mới vào được hệ thống. VC-NLĐ thường vẫn chỉ cần mã số.

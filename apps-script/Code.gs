@@ -12,7 +12,10 @@
  * Sheet DanhSachNhanSu cần cột "Email" cho Trưởng đơn vị và HR
  * (dùng để gửi mã OTP khi đăng nhập).
  *
- * Cột sheet DuLieuDanhGia:
+ * PHIẾU MỚI từ tháng 10/2026 (FORM_V2_FROM) lưu ở sheet DuLieuDanhGia_KPI
+ * (tự tạo khi có phiếu đầu tiên). Tháng trước đó vẫn dùng phiếu cũ / sheet cũ.
+ *
+ * Cột sheet DuLieuDanhGia (phiếu cũ):
  *   A ThoiGian | B ThangDanhGia (MM-YYYY, text) | C HoTen | D DonVi
  *   E-G 1.1-1.3 | H-R 11 điểm thành phần | S Tổng | T Xếp loại | U Ghi chú A+
  *   V-X Trưởng đơn vị (điểm, loại, ghi chú) | Y MSNV (mới)
@@ -83,6 +86,7 @@ const ROUTES = {
   login:                    { auth: null,      fn: login_ },
   verifyOtp:                { auth: null,      fn: verifyOtp_ },
   resendOtp:                { auth: null,      fn: resendOtp_ },
+  switchUnit:               { auth: "any",     fn: switchUnit_ },
   checkDoubleEntry:         { auth: "any",     fn: checkDoubleEntry_ },
   saveData:                 { auth: "any",     fn: saveData_ },
   getUserHistory:           { auth: "any",     fn: getUserHistory_ },
@@ -91,7 +95,8 @@ const ROUTES = {
   getAllStaffData:          { auth: "hr",      fn: getAllStaffData_ },
   exportReport:             { auth: "hr",      fn: exportReport_ },
   exportCSVData:            { auth: "hr",      fn: exportCSVData_ },
-  exportExcelData:          { auth: "hr",      fn: exportExcelData_ }
+  exportExcelData:          { auth: "hr",      fn: exportExcelData_ },
+  getExportTCCB:            { auth: "hr",      fn: getExportTCCB_ }
 };
 
 // ============================================================
@@ -167,13 +172,14 @@ function login_(args, _user, req) {
   }
 
   const user = { msnv: chosen.msnv, hoTen: chosen.hoTen, donVi: chosen.donVi, role: chosen.role };
+  const units = unitList_(matches);
 
   // Người có vai trò Trưởng đơn vị / HR ở BẤT KỲ đơn vị nào đều phải qua OTP,
   // kể cả khi đang chọn vai trò VC-NLĐ.
   const privileged = matches.some(m => PRIVILEGED_ROLES.indexOf(m.role) >= 0);
   if (!privileged) {
     logLogin_(ctx, user, "✅ Thành công");
-    return { multiUnit: false, token: signToken_(user, false), user: user };
+    return { multiUnit: false, token: signToken_(user, false), user: user, units: units };
   }
 
   const email = chosen.email || (matches.find(m => isEmail_(m.email)) || {}).email || "";
@@ -188,7 +194,7 @@ function login_(args, _user, req) {
   const code  = newOtpCode_();
   sendOtpEmail_(email, user, code, ctx);
   putOtp_(otpId, {
-    user: user, email: email, hash: otpHash_(otpId, code),
+    user: user, units: units, email: email, hash: otpHash_(otpId, code),
     exp: nowSec_() + OTP_TTL_SEC, sentAt: nowSec_(), attempts: 0, resends: 0, ip: ctx.ip
   });
   logLogin_(ctx, user, "📧 Đã gửi OTP", "Gửi tới " + maskEmail_(email), otpId);
@@ -207,7 +213,10 @@ function verifyOtp_(args, _user, req) {
   if (!/^[a-f0-9]{32}$/.test(otpId)) throw appError_("Phiên xác thực không hợp lệ, vui lòng đăng nhập lại", "OTP_EXPIRED");
   if (!/^\d{6}$/.test(code)) throw appError_("Mã OTP gồm 6 chữ số", "BAD_INPUT");
 
-  return withLock_(() => {
+  // Không dùng khóa toàn hệ thống (LockService) ở bước này: khóa đó dùng chung với lưu phiếu,
+  // giờ cao điểm người nhập OTP phải xếp hàng chờ. Mã chỉ dùng 1 lần (xóa ngay khi đúng),
+  // số lần sai giới hạn theo mã + theo IP nên vẫn an toàn.
+  {
     const rec = getOtp_(otpId);
     if (!rec) throw appError_("Mã OTP đã hết hạn, vui lòng đăng nhập lại", "OTP_EXPIRED");
     const ipNote = rec.ip && ctx.ip && rec.ip !== ctx.ip ? "IP khác lúc gửi mã (" + rec.ip + ")" : "";
@@ -234,8 +243,8 @@ function verifyOtp_(args, _user, req) {
 
     delOtp_(otpId);
     logLogin_(ctx, rec.user, "✅ Thành công (OTP)", ipNote, otpId);
-    return { token: signToken_(rec.user, true), user: rec.user };
-  });
+    return { token: signToken_(rec.user, true), user: rec.user, units: rec.units || [] };
+  }
 }
 
 function resendOtp_(args, _user, req) {
@@ -268,27 +277,56 @@ function resendOtp_(args, _user, req) {
   });
 }
 
+function unitList_(matches) {
+  return matches.map(m => ({ donVi: m.donVi, role: m.role }));
+}
+
+/**
+ * Chuyển sang đơn vị khác của chính người đang đăng nhập (người làm việc ở nhiều đơn vị),
+ * không cần đăng xuất. Đã xác thực OTP lúc đăng nhập thì không phải nhập lại.
+ */
+function switchUnit_(args, user, req) {
+  const ctx = clientCtx_(req, args);
+  const donVi = str_(args.donVi), role = str_(args.role);
+  const matches = findStaff_(user.msnv);
+  const target = matches.find(m => m.donVi === donVi && (!role || m.role === role));
+  if (!target) throw appError_("Không tìm thấy đơn vị này trong danh sách của Quý Thầy/Cô", "BAD_INPUT");
+  const mfa = user.mfa === 1;
+  if (PRIVILEGED_ROLES.indexOf(target.role) >= 0 && !mfa)
+    throw appError_("Vui lòng đăng nhập lại để xác thực OTP cho vai trò này", "AUTH");
+
+  const next = { msnv: target.msnv, hoTen: target.hoTen, donVi: target.donVi, role: target.role };
+  logLogin_(ctx, next, "🔄 Chuyển đơn vị", "Từ: " + user.donVi);
+  return { token: signToken_(next, mfa), user: next, units: unitList_(matches) };
+}
+
 function findStaff_(msnv) {
-  const data = getSheet_(SHEET_NHANSU).getDataRange().getValues();
-  const h  = data[0].map(str_);
+  const sheet = getSheet_(SHEET_NHANSU);
+  const width = sheet.getLastColumn();
+  const h  = sheet.getRange(1, 1, 1, width).getValues()[0].map(str_);
   const iM = h.indexOf("MSNV"), iH = h.indexOf("HoTen"), iD = h.indexOf("DonVi"), iR = h.indexOf("TRUONG DON VI");
   const iE = h.findIndex(x => /^(e-?mail|mail)\b/i.test(x));
   if (iM < 0 || iH < 0 || iD < 0)
     throw appError_("Sheet " + SHEET_NHANSU + " thiếu cột MSNV / HoTen / DonVi", "CONFIG");
 
-  const out = [];
-  for (let i = 1; i < data.length; i++) {
-    if (!matchesId_(data[i][iM], msnv)) continue;
-    const r = iR >= 0 ? str_(data[i][iR]).toLowerCase() : "";
-    const e = iE >= 0 ? str_(data[i][iE]).toLowerCase() : "";
-    out.push({
-      msnv:  str_(data[i][iM]),
-      hoTen: str_(data[i][iH]),
-      donVi: str_(data[i][iD]),
-      role:  r === "hr" ? "hr" : r === "x" ? "manager" : "staff",
+  const parse = rows => rows.filter(r => matchesId_(r[iM], msnv)).map(r => {
+    const role = iR >= 0 ? str_(r[iR]).toLowerCase() : "";
+    const e = iE >= 0 ? str_(r[iE]).toLowerCase() : "";
+    return {
+      msnv:  str_(r[iM]),
+      hoTen: str_(r[iH]),
+      donVi: str_(r[iD]),
+      role:  role === "hr" ? "hr" : role === "x" ? "manager" : "staff",
       email: isEmail_(e) ? e : ""
-    });
-  }
+    };
+  });
+
+  // Nhanh: chỉ đọc các dòng có MSNV chứa mã đã nhập (bỏ số 0 đầu)
+  const key = normalizeId_(msnv);
+  if (!key) return [];
+  let out = parse(readRows_(sheet, findRows_(sheet, iM, key, false), width).map(x => x.r));
+  // Dự phòng: đọc cả sheet nếu không tìm thấy (vd. ô định dạng số hiển thị khác)
+  if (!out.length) out = parse(sheet.getDataRange().getValues().slice(1));
   return out;
 }
 
@@ -529,6 +567,10 @@ function logLogin_(ctx, user, status, detail, sessionId) {
 }
 
 function ensureLoginHeader_(sheet) {
+  const cache = CacheService.getScriptCache();
+  const ck = "loginhdr_" + LOGIN_HEADERS.length;
+  if (cache.get(ck)) return;
+  cache.put(ck, "1", 6 * 60 * 60);
   const range = sheet.getRange(1, 1, 1, LOGIN_HEADERS.length);
   const cur = range.getValues()[0].map(str_);
   if (cur.join("|") === LOGIN_HEADERS.join("|")) return;
@@ -538,13 +580,294 @@ function ensureLoginHeader_(sheet) {
 }
 
 // ============================================================
+// PHIẾU MỚI (mẫu chính thức) — áp dụng từ tháng FORM_V2_FROM
+//   "Tiêu chí đánh giá hiệu quả công việc hàng tháng đối với VC, NLĐ
+//    khối hành chính, hỗ trợ, phục vụ"
+//   I.  Tiêu chí chung 30đ — chấm đúng chỗ phiếu ghi điểm, mọi mục bước 0,5:
+//       1.1–1.5 mỗi tiêu chí 2đ | các ý của 2.1–2.4 (1đ, riêng ý "thường xuyên" 2đ)
+//       | 3.1 (4đ), 3.2 (3đ), 3.3 (3đ)
+//   II. Kết quả thực hiện nhiệm vụ 70đ
+//   III. Điểm thưởng tối đa 7đ; tổng sau cộng tối đa 100
+// Lưu ở sheet riêng SHEET_DANHGIA_V2, sheet cũ giữ nguyên.
+// ============================================================
+const FORM_V2_FROM     = "10-2026";
+const SHEET_DANHGIA_V2 = "DuLieuDanhGia_KPI";
+const TEXT_MAX_WORDS   = 100;
+const BONUS_MAX        = 7;
+
+const V2_RULES = {
+  i11:  { label: "1.1",   allowed: range_(0, 2, 0.5) },
+  i12:  { label: "1.2",   allowed: range_(0, 2, 0.5) },
+  i13:  { label: "1.3",   allowed: range_(0, 2, 0.5) },
+  i14:  { label: "1.4",   allowed: range_(0, 2, 0.5) },
+  i15:  { label: "1.5",   allowed: range_(0, 2, 0.5) },
+  i211: { label: "2.1.1", allowed: range_(0, 1, 0.5) },
+  i212: { label: "2.1.2", allowed: range_(0, 1, 0.5) },
+  i213: { label: "2.1.3", allowed: range_(0, 1, 0.5) },
+  i221: { label: "2.2.1", allowed: range_(0, 2, 0.5) },
+  i222: { label: "2.2.2", allowed: range_(0, 1, 0.5) },
+  i231: { label: "2.3.1", allowed: range_(0, 1, 0.5) },
+  i232: { label: "2.3.2", allowed: range_(0, 1, 0.5) },
+  i241: { label: "2.4.1", allowed: range_(0, 1, 0.5) },
+  i242: { label: "2.4.2", allowed: range_(0, 1, 0.5) },
+  i31:  { label: "3.1",   allowed: range_(0, 4, 0.5) },
+  i32:  { label: "3.2",   allowed: range_(0, 3, 0.5) },
+  i33:  { label: "3.3",   allowed: range_(0, 3, 0.5) },
+  ii1:  { label: "II.1",  allowed: [0, 14, 15, 16, 17, 18, 18.5, 19, 19.5, 20] },
+  ii2:  { label: "II.2",  allowed: [0, 12, 13, 14, 15, 16, 17, 18, 19, 20] },
+  ii3:  { label: "II.3",  allowed: [0, 22, 23, 24, 25, 26, 27, 28, 29, 30] }
+};
+const V2_KEYS = Object.keys(V2_RULES);
+
+// Cột sheet: A–E thông tin, tiếp theo là các ô điểm theo thứ tự V2_KEYS, rồi tổng hợp
+const V2COL = (function () {
+  const c = { THOIGIAN: 0, THANG: 1, MSNV: 2, HOTEN: 3, DONVI: 4, DIEM: 5 };
+  let n = 5 + V2_KEYS.length;
+  ["TONGKPI", "THUONG", "MOTATHUONG", "TONGDIEM", "XEPLOAI", "CANCUVUOT", "LYDO",
+   "SEPTHUONG", "SEPDIEM", "SEPLOAI", "SEPGHICHU"].forEach(k => { c[k] = n++; });
+  c.TOTAL = n;
+  return c;
+})();
+const V2_TOTAL_COLS = V2COL.TOTAL;
+const V2_TAIL_HEADERS = [
+  "Tổng KPI (I+II)", "Thưởng đề xuất", "Mô tả cách làm hay & minh chứng", "Tổng điểm (≤100)",
+  "Tự xếp loại", "Căn cứ xác nhận vượt mức (A+)", "Ghi chú xếp loại",
+  "Thưởng TĐV công nhận", "Điểm TĐV", "TĐV xếp loại", "Ghi chú TĐV"
+];
+const V2_HEADERS = ["Thời gian", "Tháng đánh giá", "MSNV", "Họ tên", "Đơn vị"]
+  .concat(V2_KEYS.map(k => V2_RULES[k].label), V2_TAIL_HEADERS);
+const REPORT_HEADERS_V2 = ["STT", "Họ và tên", "Đơn vị"]
+  .concat(V2_KEYS.map(k => V2_RULES[k].label), V2_TAIL_HEADERS);
+
+function isV2Month_(month) { return monthKey_(month) >= monthKey_(FORM_V2_FROM); }
+
+/** Điểm thưởng tối đa: đủ 7 điểm (theo quyết định của Phòng TCCB, không áp giới hạn 10% KPI) */
+function bonusCap_(_kpi) { return BONUS_MAX; }
+
+/**
+ * Xếp loại chỉ theo tổng điểm (đã cộng thưởng, tối đa 100):
+ *   A+ ≥ 90 · A 70 – <90 · B 50 – <70 · C < 50
+ * Không hạ xếp loại theo điểm phần II. Mức A+ bắt buộc ghi căn cứ xác nhận vượt mức.
+ * (Giữ tham số ii1–ii3 để không phải đổi chỗ gọi.)
+ */
+function gradeV2_(total, _ii1, _ii2, _ii3) {
+  const g = total >= 90 ? "A+" : total >= 70 ? "A" : total >= 50 ? "B" : "C";
+  return { grade: g, scoreGrade: g, reasons: [] };
+}
+
+function countWords_(s) { const t = str_(s); return t ? t.split(/\s+/).length : 0; }
+function cleanText_(s, label) {
+  const t = str_(s).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "").slice(0, 1500);
+  if (countWords_(t) > TEXT_MAX_WORDS) throw appError_(label + " tối đa " + TEXT_MAX_WORDS + " từ", "BAD_INPUT");
+  return t;
+}
+function round1_(n) { return Math.round(n * 10) / 10; }
+
+function getV2Sheet_(create) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(SHEET_DANHGIA_V2);
+  if (!sh && create) {
+    sh = ss.insertSheet(SHEET_DANHGIA_V2);
+    sh.getRange(1, 1, 1, V2_TOTAL_COLS).setValues([V2_HEADERS])
+      .setBackground("#0f2557").setFontColor("white").setFontWeight("bold").setWrap(true);
+    sh.setFrozenRows(1);
+    sh.getRange("B:C").setNumberFormat("@");
+  }
+  return sh;
+}
+
+function rowMonthV2_(r) { return normalizeMonth_(r[V2COL.THANG]); }
+function rowOwnedV2_(r, user) { return matchesId_(r[V2COL.MSNV], user.msnv); }
+function hasEntryV2_(data, user, month) {
+  for (let i = 1; i < data.length; i++)
+    if (rowOwnedV2_(data[i], user) && rowMonthV2_(data[i]) === month) return true;
+  return false;
+}
+
+function numOrBlank_(v) {
+  if (v === "" || v === null || v === undefined) return "";
+  const n = Number(v);
+  return isNaN(n) ? "" : n;
+}
+
+function mapRowV2_(r, i) {
+  const diem = {};
+  V2_KEYS.forEach((k, j) => { diem[k] = numOrBlank_(r[V2COL.DIEM + j]); });
+  return {
+    version:     2,
+    rowId:       i + 1,
+    msnv:        str_(r[V2COL.MSNV]),
+    hoTen:       str_(r[V2COL.HOTEN]),
+    donVi:       str_(r[V2COL.DONVI]),
+    diem:        diem,
+    tongKpi:     numOrBlank_(r[V2COL.TONGKPI]),
+    thuong:      numOrBlank_(r[V2COL.THUONG]),
+    moTaThuong:  str_(r[V2COL.MOTATHUONG]),
+    tongDiem:    numOrBlank_(r[V2COL.TONGDIEM]),
+    xepLoai:     str_(r[V2COL.XEPLOAI]),
+    canCuVuot:   str_(r[V2COL.CANCUVUOT]),
+    lyDo:        str_(r[V2COL.LYDO]),
+    sepThuong:   numOrBlank_(r[V2COL.SEPTHUONG]),
+    sepDiem:     numOrBlank_(r[V2COL.SEPDIEM]),
+    sepLoai:     str_(r[V2COL.SEPLOAI]),
+    sepGhiChu:   str_(r[V2COL.SEPGHICHU])
+  };
+}
+
+function reportRowV2_(it, idx) {
+  return [idx + 1, it.hoTen, it.donVi]
+    .concat(V2_KEYS.map(k => it.diem[k]))
+    .concat([it.tongKpi, it.thuong, it.moTaThuong, it.tongDiem, it.xepLoai,
+             it.canCuVuot, it.lyDo, it.sepThuong, it.sepDiem, it.sepLoai, it.sepGhiChu]);
+}
+
+function saveDataV2_(form, user, month) {
+  const scores = {};
+  let kpi = 0;
+  V2_KEYS.forEach(k => {
+    const raw = str_(form[k]);
+    const v = Number(raw);
+    if (raw === "" || V2_RULES[k].allowed.indexOf(v) < 0)
+      throw appError_("Điểm mục " + V2_RULES[k].label + " không hợp lệ", "BAD_INPUT");
+    scores[k] = v;
+    kpi += v;
+  });
+  kpi = round1_(kpi);
+
+  const cap = bonusCap_(kpi);
+  const thuong = Number(str_(form.thuong) || 0);
+  if (isNaN(thuong) || thuong < 0 || Math.round(thuong * 2) !== thuong * 2)
+    throw appError_("Điểm thưởng không hợp lệ", "BAD_INPUT");
+  if (thuong > cap)
+    throw appError_("Điểm thưởng tối đa " + cap + " điểm", "BAD_INPUT");
+  let moTa = "";
+  if (thuong > 0) {
+    moTa = cleanText_(form.moTaThuong, "Mô tả điểm thưởng");
+    if (!moTa) throw appError_("Vui lòng mô tả cách làm hay / phương pháp mới và minh chứng cho điểm thưởng", "BAD_INPUT");
+  }
+  const total = Math.min(100, round1_(kpi + thuong));
+
+  const g = gradeV2_(total, scores.ii1, scores.ii2, scores.ii3);
+  let canCu = "";
+  if (g.grade === "A+") {
+    canCu = cleanText_(form.canCuVuot, "Căn cứ xác nhận vượt mức");
+    if (!canCu) throw appError_("Vui lòng ghi căn cứ xác nhận vượt mức yêu cầu (bắt buộc khi xếp loại A+)", "BAD_INPUT");
+  }
+
+  return withLock_(() => {
+    const sheet = getV2Sheet_(true);
+    if (userRowsV2_(sheet, user).some(x => rowMonthV2_(x.r) === month && str_(x.r[V2COL.DONVI]) === user.donVi))
+      throw appError_("Bạn đã gửi đánh giá tháng " + month.replace("-", "/") + " tại " + user.donVi + " rồi!", "DUPLICATE");
+
+    const row = new Array(V2_TOTAL_COLS).fill("");
+    row[V2COL.THOIGIAN]   = new Date();
+    row[V2COL.THANG]      = month;
+    row[V2COL.MSNV]       = user.msnv;
+    row[V2COL.HOTEN]      = user.hoTen;
+    row[V2COL.DONVI]      = user.donVi;
+    V2_KEYS.forEach((k, j) => { row[V2COL.DIEM + j] = scores[k]; });
+    row[V2COL.TONGKPI]    = kpi;
+    row[V2COL.THUONG]     = thuong;
+    row[V2COL.MOTATHUONG] = safeCell_(moTa);
+    row[V2COL.TONGDIEM]   = total;
+    row[V2COL.XEPLOAI]    = g.grade;
+    row[V2COL.CANCUVUOT]  = safeCell_(canCu);
+    row[V2COL.LYDO]       = g.reasons.join("; ");
+
+    const newRow = sheet.getLastRow() + 1;
+    sheet.getRange(newRow, V2COL.THANG + 1, 1, 2).setNumberFormat("@");
+    sheet.getRange(newRow, 1, 1, V2_TOTAL_COLS).setValues([row]);
+    SpreadsheetApp.flush();
+    return { score: total.toFixed(1), grade: g.grade, reasons: g.reasons, version: 2 };
+  });
+}
+
+function listV2_(month, donVi) {
+  const sheet = getV2Sheet_(false);
+  if (!sheet) return [];
+  return monthRowsV2_(sheet, month)
+    .filter(x => donVi === undefined || str_(x.r[V2COL.DONVI]) === donVi)
+    .map(x => mapRowV2_(x.r, x.row - 1));
+}
+
+/**
+ * Ghi nhiều dòng (cùng các cột) với ít lần gọi Sheets: các dòng gần nhau được gộp
+ * thành một khối đọc–sửa–ghi (đang giữ LockService nên an toàn).
+ */
+function writeBlock_(sheet, writes, col, width) {
+  writes = writes.slice().sort((a, b) => a.row - b.row);
+  for (let i = 0; i < writes.length;) {
+    let j = i;
+    while (j + 1 < writes.length && writes[j + 1].row - writes[j].row <= 25) j++;
+    const start = writes[i].row, end = writes[j].row;
+    if (i === j) {
+      sheet.getRange(start, col, 1, width).setValues([writes[i].values]);
+    } else {
+      const rg = sheet.getRange(start, col, end - start + 1, width);
+      const vals = rg.getValues();
+      for (let k = i; k <= j; k++) vals[writes[k].row - start] = writes[k].values;
+      rg.setValues(vals);
+    }
+    i = j + 1;
+  }
+}
+
+function updateManagerV2_(items, user, month) {
+  const clean = items.map(it => {
+    it = it || {};
+    const hoTen = str_(it.hoTen);
+    const base = parseMgrItem_(it);
+    const rawT = str_(it.sepThuong).replace(",", ".");
+    let sepThuong = "";
+    if (rawT !== "") {
+      sepThuong = Number(rawT);
+      if (isNaN(sepThuong) || sepThuong < 0 || sepThuong > BONUS_MAX || Math.round(sepThuong * 2) !== sepThuong * 2)
+        throw appError_("Thưởng công nhận của " + hoTen + " phải từ 0 đến " + BONUS_MAX + " (bước 0,5)", "BAD_INPUT");
+    }
+    base.sepThuong = sepThuong;
+    return base;
+  });
+
+  return withLock_(() => {
+    const sheet = getV2Sheet_(false);
+    if (!sheet) throw appError_("Chưa có phiếu nào của tháng này", "NO_DATA");
+    const rows = monthRowsV2_(sheet, month).filter(x => str_(x.r[V2COL.DONVI]) === user.donVi);
+    const byRow = {};
+    rows.forEach(x => { byRow[x.row] = x; });
+    const owns = (x, it) => it.msnv ? matchesId_(x.r[V2COL.MSNV], it.msnv) : str_(x.r[V2COL.HOTEN]) === it.hoTen;
+
+    // Kiểm tra hết trước, rồi mới ghi (tránh ghi dở dang khi một dòng lỗi)
+    const missing = [];
+    const writes = [];
+    clean.forEach(it => {
+      let hit = byRow[it.rowId] && owns(byRow[it.rowId], it) ? byRow[it.rowId] : null;
+      if (!hit) hit = rows.find(x => owns(x, it)) || null;
+      if (!hit) { missing.push(it.hoTen); return; }
+      const proposed = Number(hit.r[V2COL.THUONG]) || 0;
+      const t = it.sepThuong === "" ? proposed : it.sepThuong;   // để trống = công nhận như đề xuất
+      if (t > proposed)
+        throw appError_("Thưởng công nhận của " + it.hoTen + " không được vượt mức đề xuất (" + proposed + "đ)", "BAD_INPUT");
+      writes.push({ row: hit.row, values: [t, it.sepDiem, it.sepLoai, safeCell_(it.sepGhiChu)] });
+    });
+    writeBlock_(sheet, writes, V2COL.SEPTHUONG + 1, 4);
+    const saved = writes.length;
+    SpreadsheetApp.flush();
+    return { saved: saved, missing: missing };
+  });
+}
+
+// ============================================================
 // 2. KIỂM TRA TRÙNG LẶP (theo MSNV của người đang đăng nhập)
 // ============================================================
 function checkDoubleEntry_(args, user) {
   const month = requireMonth_(args.month);
+  if (isV2Month_(month)) {
+    const sh = getV2Sheet_(false);
+    return sh ? userRowsV2_(sh, user).some(x => rowMonthV2_(x.r) === month && str_(x.r[V2COL.DONVI]) === user.donVi) : false;
+  }
   const sheet = getSheet_(SHEET_DANHGIA, true);
   if (!sheet) return false;
-  return hasEntry_(sheet.getDataRange().getValues(), user, month);
+  return userRowsV1_(sheet, user).some(x => rowMonth_(x.r) === month && str_(x.r[COL.DONVI]) === user.donVi);
 }
 
 // ============================================================
@@ -554,6 +877,11 @@ function checkDoubleEntry_(args, user) {
 function saveData_(args, user) {
   const form  = args.form || {};
   const month = requireMonth_(form.assessmentMonth);
+  const v2 = isV2Month_(month);
+  if (v2 !== (Number(form.formVersion) === 2))
+    throw appError_("Tháng " + month.replace("-", "/") + " dùng mẫu phiếu " + (v2 ? "mới" : "cũ") +
+                    ". Vui lòng tải lại trang (F5) rồi đánh giá lại.", "FORM_VERSION");
+  if (v2) return saveDataV2_(form, user, month);
 
   const crit = ["diem_1_1", "diem_1_2", "diem_1_3"].map(k => {
     const v = str_(form[k]);
@@ -588,7 +916,7 @@ function saveData_(args, user) {
     const sheet = getSheet_(SHEET_DANHGIA);
     ensureMsnvHeader_(sheet);
     if (hasEntry_(sheet.getDataRange().getValues(), user, month))
-      throw appError_("Bạn đã gửi đánh giá tháng " + month.replace("-", "/") + " rồi!", "DUPLICATE");
+      throw appError_("Bạn đã gửi đánh giá tháng " + month.replace("-", "/") + " tại " + user.donVi + " rồi!", "DUPLICATE");
 
     const row = new Array(TOTAL_COLS).fill("");
     row[COL.THOIGIAN]     = new Date();
@@ -620,16 +948,14 @@ function saveData_(args, user) {
 // ============================================================
 function getStaffData_(args, user) {
   const month = requireMonth_(args.month);
+  if (isV2Month_(month))
+    return listV2_(month, user.donVi).sort((a, b) => a.hoTen.localeCompare(b.hoTen, "vi"));
   const sheet = getSheet_(SHEET_DANHGIA, true);
   if (!sheet) return [];
-  const data = sheet.getDataRange().getValues();
-  const out = [];
-  for (let i = 1; i < data.length; i++) {
-    const r = data[i];
-    if (str_(r[COL.DONVI]) !== user.donVi || rowMonth_(r) !== month) continue;
-    out.push(mapRow_(r, i));
-  }
-  return out.sort((a, b) => a.hoTen.localeCompare(b.hoTen, "vi"));
+  return monthRowsV1_(sheet, month)
+    .filter(x => str_(x.r[COL.DONVI]) === user.donVi)
+    .map(x => mapRow_(x.r, x.row - 1))
+    .sort((a, b) => a.hoTen.localeCompare(b.hoTen, "vi"));
 }
 
 // ============================================================
@@ -642,6 +968,7 @@ function updateManagerEvaluations_(args, user) {
   const items = Array.isArray(args.items) ? args.items : [];
   if (!items.length) throw appError_("Không có đánh giá nào để lưu", "BAD_INPUT");
   if (items.length > 1000) throw appError_("Quá nhiều dòng trong một lần lưu", "BAD_INPUT");
+  if (isV2Month_(month)) return updateManagerV2_(items, user, month);
   const clean = items.map(parseMgrItem_);
 
   const lock = LockService.getScriptLock();
@@ -703,13 +1030,28 @@ function parseMgrItem_(it) {
 // 6. LỊCH SỬ CÁ NHÂN
 // ============================================================
 function getUserHistory_(_args, user) {
-  const sheet = getSheet_(SHEET_DANHGIA, true);
-  if (!sheet) return [];
-  const data = sheet.getDataRange().getValues();
   const out = [];
-  for (let i = 1; i < data.length; i++) {
+  const shV2 = getV2Sheet_(false);
+  if (shV2) {
+    const d2 = userRowsV2_(shV2, user).map(x => x.r);
+    for (let i = 0; i < d2.length; i++) {
+      const r = d2[i];
+      const thang = rowMonthV2_(r);
+      if (!thang) continue;
+      out.push({
+        thang: thang,
+        donVi: str_(r[V2COL.DONVI]),
+        tongDiem: cellOut_(r[V2COL.TONGDIEM]),
+        xepLoai: str_(r[V2COL.XEPLOAI]),
+        sepLoai: str_(r[V2COL.SEPLOAI])
+      });
+    }
+  }
+  const sheet = getSheet_(SHEET_DANHGIA, true);
+  if (!sheet) return out.sort((a, b) => monthKey_(b.thang) - monthKey_(a.thang));
+  const data = userRowsV1_(sheet, user).map(x => x.r);
+  for (let i = 0; i < data.length; i++) {
     const r = data[i];
-    if (!rowOwnedBy_(r, user)) continue;
     const thang = rowMonth_(r);
     if (!thang) continue;
     out.push({
@@ -731,15 +1073,13 @@ function getAllStaffData_(args) {
 }
 
 function listAll_(month) {
+  if (isV2Month_(month))
+    return listV2_(month).sort((a, b) => a.donVi.localeCompare(b.donVi, "vi") || a.hoTen.localeCompare(b.hoTen, "vi"));
   const sheet = getSheet_(SHEET_DANHGIA, true);
   if (!sheet) return [];
-  const data = sheet.getDataRange().getValues();
-  const out = [];
-  for (let i = 1; i < data.length; i++) {
-    if (rowMonth_(data[i]) !== month) continue;
-    out.push(mapRow_(data[i], i));
-  }
-  return out.sort((a, b) => a.donVi.localeCompare(b.donVi, "vi") || a.hoTen.localeCompare(b.hoTen, "vi"));
+  return monthRowsV1_(sheet, month)
+    .map(x => mapRow_(x.r, x.row - 1))
+    .sort((a, b) => a.donVi.localeCompare(b.donVi, "vi") || a.hoTen.localeCompare(b.hoTen, "vi"));
 }
 
 // ============================================================
@@ -760,9 +1100,12 @@ function buildReportSheet_(month) {
   if (old) ss.deleteSheet(old);
   const report = ss.insertSheet(sheetName);
 
-  const rows = data.map((it, idx) => [idx + 1, it.hoTen, it.donVi].concat(it.chiTiet, [it.sepDiem, it.sepLoai, it.sepGhiChu]));
-  const w = REPORT_HEADERS.length;
-  report.getRange(1, 1, 1, w).setValues([REPORT_HEADERS])
+  const v2 = isV2Month_(month);
+  const headers = v2 ? REPORT_HEADERS_V2 : REPORT_HEADERS;
+  const rows = v2 ? data.map(reportRowV2_)
+                  : data.map((it, idx) => [idx + 1, it.hoTen, it.donVi].concat(it.chiTiet, [it.sepDiem, it.sepLoai, it.sepGhiChu]));
+  const w = headers.length;
+  report.getRange(1, 1, 1, w).setValues([headers])
         .setBackground("#0f2557").setFontColor("white").setFontWeight("bold");
   report.getRange(2, 1, rows.length, w).setValues(rows)
         .setBackgrounds(rows.map((_, i) => new Array(w).fill(i % 2 === 0 ? "#f8fafc" : "#ffffff")));
@@ -771,6 +1114,57 @@ function buildReportSheet_(month) {
   SpreadsheetApp.flush();
 
   return { sheet: report, sheetName: sheetName, total: data.length, url: ss.getUrl() + "#gid=" + report.getSheetId(), data: data };
+}
+
+// ============================================================
+// BẢNG TỔNG HỢP CHI THU NHẬP TĂNG THÊM (mẫu Phòng TCCB) — dữ liệu cho trang web dựng file .xlsx
+// Bổ sung Chức danh (cột CD/CV) và Đơn vị lớn (cột "ĐƠN VỊ") từ DanhSachNhanSu.
+// ============================================================
+function normHeader_(h) {
+  return str_(h).normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[đĐ]/g, "D")
+    .toUpperCase().replace(/\s+/g, " ").trim();
+}
+
+function staffInfoMap_() {
+  const data = getSheet_(SHEET_NHANSU).getDataRange().getValues();
+  const raw = data[0].map(str_);
+  const h = raw.map(normHeader_);
+  const iM = raw.indexOf("MSNV"), iD = raw.indexOf("DonVi");
+  const iC = h.findIndex(x => /^(CD\s*\/\s*CV|CHUC DANH|CHUC VU)/.test(x));
+  const iU = h.findIndex((x, i) => i !== iD && /^(DON VI|DON VI LON|DON VI QUAN LY|KHOI)$/.test(x));
+  const map = {};
+  for (let i = 1; i < data.length; i++) {
+    const id = normalizeId_(data[i][iM]);
+    if (!id) continue;
+    const info = { chucDanh: iC >= 0 ? str_(data[i][iC]) : "", donViLon: iU >= 0 ? str_(data[i][iU]) : "" };
+    map[id + "|" + str_(data[i][iD])] = info;
+    if (!map[id]) map[id] = info;
+  }
+  return map;
+}
+
+function getExportTCCB_(args) {
+  const month = requireMonth_(args.month);
+  const v2 = isV2Month_(month);
+  const list = listAll_(month);
+  const info = staffInfoMap_();
+  const rows = list.map(it => {
+    const id = normalizeId_(it.msnv);
+    const inf = info[id + "|" + it.donVi] || info[id] || { chucDanh: "", donViLon: "" };
+    let yKien;
+    if (v2) {
+      yKien = [it.canCuVuot, it.moTaThuong ? "Cách làm hay (đề xuất thưởng " + it.thuong + "đ): " + it.moTaThuong : ""]
+        .filter(Boolean).join("\n");
+    } else {
+      yKien = str_(it.chiTiet[16]);
+    }
+    return {
+      msnv: it.msnv, hoTen: it.hoTen, chucDanh: inf.chucDanh, boMon: it.donVi, donViLon: inf.donViLon,
+      tongDiem: it.tongDiem, xepLoai: it.xepLoai, yKien: yKien,
+      sepDiem: it.sepDiem, sepLoai: it.sepLoai, sepGhiChu: it.sepGhiChu
+    };
+  });
+  return { month: month, rows: rows };
 }
 
 function exportCSVData_(args) {
@@ -782,9 +1176,12 @@ function exportCSVData_(args) {
     const s = (v === null || v === undefined) ? "" : String(v);
     return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
   };
-  const lines = [REPORT_HEADERS.map(escape).join(",")];
+  const v2 = isV2Month_(month);
+  const lines = [(v2 ? REPORT_HEADERS_V2 : REPORT_HEADERS).map(escape).join(",")];
   data.forEach((it, idx) => {
-    lines.push([idx + 1, it.hoTen, it.donVi].concat(it.chiTiet, [it.sepDiem, it.sepLoai, it.sepGhiChu]).map(escape).join(","));
+    const row = v2 ? reportRowV2_(it, idx)
+                   : [idx + 1, it.hoTen, it.donVi].concat(it.chiTiet, [it.sepDiem, it.sepLoai, it.sepGhiChu]);
+    lines.push(row.map(escape).join(","));
   });
 
   const csv = "\uFEFF" + lines.join("\r\n");
@@ -817,11 +1214,11 @@ function exportExcelData_(args) {
 // TOKEN PHIÊN ĐĂNG NHẬP (HMAC-SHA256)
 // ============================================================
 function getSecret_() {
-  const props = PropertiesService.getScriptProperties();
-  let s = props.getProperty("TOKEN_SECRET");
+  let s = prop_("TOKEN_SECRET");
   if (!s) {
     s = Utilities.getUuid() + Utilities.getUuid();
-    props.setProperty("TOKEN_SECRET", s);
+    PropertiesService.getScriptProperties().setProperty("TOKEN_SECRET", s);
+    PROPS_CACHE_.TOKEN_SECRET = s;
   }
   return s;
 }
@@ -858,9 +1255,68 @@ function verifyToken_(token) {
 }
 
 function checkProxyKey_(key) {
-  const expected = PropertiesService.getScriptProperties().getProperty("PROXY_KEY");
+  const expected = prop_("PROXY_KEY");
   if (!expected) throw appError_("Máy chủ chưa cấu hình PROXY_KEY (Script properties)", "CONFIG");
   if (str_(key) !== expected) throw appError_("Không có quyền truy cập", "FORBIDDEN");
+}
+
+// ============================================================
+// ĐỌC NHANH — chỉ đọc những dòng cần, không đọc cả sheet
+// ============================================================
+/** Số dòng (1-based) có ô ở cột `col` (0-based) khớp `text` */
+function findRows_(sheet, col, text, exact) {
+  const last = sheet.getLastRow();
+  if (last < 2 || !str_(text)) return [];
+  let tf = sheet.getRange(2, col + 1, last - 1, 1).createTextFinder(String(text));
+  if (exact !== false) tf = tf.matchEntireCell(true);
+  return tf.findAll().map(c => c.getRow());
+}
+/** Đọc các dòng chỉ định; dòng gần nhau được gộp thành một lần đọc */
+function readRows_(sheet, rows, width) {
+  rows = Array.from(new Set(rows)).sort((a, b) => a - b);
+  const out = [];
+  for (let i = 0; i < rows.length;) {
+    let j = i;
+    while (j + 1 < rows.length && rows[j + 1] - rows[j] <= 25) j++;
+    const start = rows[i], end = rows[j];
+    const want = {};
+    rows.slice(i, j + 1).forEach(r => { want[r] = true; });
+    sheet.getRange(start, 1, end - start + 1, width).getValues()
+      .forEach((r, k) => { if (want[start + k]) out.push({ row: start + k, r: r }); });
+    i = j + 1;
+  }
+  return out;
+}
+/** Các dòng phiếu mới của một tháng */
+function monthRowsV2_(sheet, month) {
+  return readRows_(sheet, findRows_(sheet, V2COL.THANG, month), V2_TOTAL_COLS)
+    .filter(x => rowMonthV2_(x.r) === month);
+}
+/** Các dòng phiếu mới của một người */
+function userRowsV2_(sheet, user) {
+  return readRows_(sheet, findRows_(sheet, V2COL.MSNV, user.msnv), V2_TOTAL_COLS)
+    .filter(x => rowOwnedV2_(x.r, user));
+}
+/** Các dòng phiếu cũ của một tháng (dự phòng đọc cả sheet nếu ô tháng không phải dạng chữ) */
+function monthRowsV1_(sheet, month) {
+  const hits = readRows_(sheet, findRows_(sheet, COL.THANGDANHGIA, month), TOTAL_COLS)
+    .filter(x => rowMonth_(x.r) === month);
+  if (hits.length) return hits;
+  return sheet.getDataRange().getValues()
+    .map((r, i) => ({ row: i + 1, r: r })).slice(1)
+    .filter(x => rowMonth_(x.r) === month);
+}
+/** Các dòng phiếu cũ của một người (theo MSNV hoặc họ tên với dòng cũ chưa có MSNV) */
+function userRowsV1_(sheet, user) {
+  const rows = findRows_(sheet, COL.MSNV, user.msnv).concat(findRows_(sheet, COL.HOTEN, user.hoTen));
+  return readRows_(sheet, rows, TOTAL_COLS).filter(x => rowOwnedBy_(x.r, user));
+}
+
+// Script properties: đọc 1 lần cho mỗi yêu cầu
+let PROPS_CACHE_ = null;
+function prop_(k) {
+  if (!PROPS_CACHE_) PROPS_CACHE_ = PropertiesService.getScriptProperties().getProperties();
+  return PROPS_CACHE_[k];
 }
 
 // ============================================================
@@ -936,7 +1392,7 @@ function rowOwnedBy_(row, user) {
 
 function hasEntry_(data, user, month) {
   for (let i = 1; i < data.length; i++)
-    if (rowOwnedBy_(data[i], user) && rowMonth_(data[i]) === month) return true;
+    if (rowOwnedBy_(data[i], user) && rowMonth_(data[i]) === month && str_(data[i][COL.DONVI]) === user.donVi) return true;
   return false;
 }
 
