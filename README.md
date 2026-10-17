@@ -74,6 +74,29 @@ git push -u origin main
 
 Từ đó mỗi lần `git push` lên nhánh `main`, Cloudflare tự triển khai lại. `wrangler.toml` có `keep_vars = true` nên các biến đặt trên dashboard không bị xóa khi deploy.
 
+### Nhiều Worker dùng chung MỘT repo (khuyên dùng)
+
+Không cần nhân bản repo cho từng Worker. Tất cả Worker nối vào **cùng repo này**, chỉ khác *Deploy command*:
+
+| Worker | Deploy command |
+|---|---|
+| `danhgia` (chính) | `npx wrangler deploy` |
+| `ktthu` | `npx wrangler deploy --env ktthu` |
+| `ttgdyh` | `npx wrangler deploy --env ttgdyh` |
+
+Thêm Worker mới tên `abc`:
+1. Thêm 2 dòng vào cuối `wrangler.toml` rồi push:
+   ```toml
+   [env.abc]
+   name = "abc"
+   ```
+2. Trên Cloudflare: Worker `abc` → **Settings → Build → Git repository**: nối vào repo này; *Deploy command* = `npx wrangler deploy --env abc`.
+3. Đặt `APPS_SCRIPT_URL` (link Web App của bản sao Google Sheet tương ứng) và `PROXY_KEY` riêng cho Worker `abc`.
+
+Mỗi lần sửa code chỉ cần push **một lần** → mọi Worker tự build lại. Mỗi Worker vẫn dùng Google Sheet/Apps Script riêng qua biến của nó.
+
+> ⚠️ Riêng `Code.gs` thì **mỗi bản sao Google Sheet phải dán lại và Deploy → New version** (Apps Script không tự cập nhật theo GitHub). Nếu quên, giao diện hiện **dải vàng "Apps Script của bản này là bản cũ"** ở đầu trang để biết ngay bản nào chưa cập nhật.
+
 ### Chạy thử trên máy (tùy chọn)
 
 ```bash
@@ -187,3 +210,8 @@ Mỗi lần đăng nhập, sai mã, gửi/gửi lại OTP, sai OTP… đều đ�
 | *Không có quyền truy cập* | `PROXY_KEY` hai bên chưa trùng nhau |
 | *Apps Script không trả về JSON* | Sai URL Web App, hoặc chưa đặt *Who has access = Anyone* |
 | Sửa `Code.gs` nhưng không thấy thay đổi | Chưa tạo **New version** khi deploy |
+| Dải vàng *"Apps Script của bản này là bản cũ"* | Dán `Code.gs` mới vào bản sao Google Sheet của Worker đó → Deploy → Manage deployments → ✏️ → **New version** |
+| *Máy chủ trả dữ liệu không đúng dạng* | Giao diện và Apps Script lệch phiên bản — cập nhật `Code.gs` như dòng trên. Phiếu đã gửi vẫn được lưu; xem ở "Kết quả & lịch sử" |
+| Chân trang hiện phiên bản | Dòng "phiên bản 2026.10.17" cuối trang cho biết giao diện đang chạy bản nào; nếu thấy bản cũ, nhấn Ctrl+F5 |
+
+**Tự bảo vệ dữ liệu:** sheet mới tạo trong Google Sheets mặc định chỉ có 1000 dòng × 26 cột. Từ bản 2026.10.17, Apps Script tự nới thêm dòng/cột trước khi ghi (phiếu mới cần 36 cột, báo cáo 34 cột), nên không còn lỗi khi số phiếu vượt 1000 hoặc sheet thiếu cột.

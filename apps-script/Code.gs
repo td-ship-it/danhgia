@@ -22,6 +22,7 @@
  * ============================================================
  */
 
+const API_VERSION   = "2026.10.17";   // giao diện so khớp số này để báo khi Apps Script chưa cập nhật
 const SHEET_NHANSU  = "DanhSachNhanSu";
 const SHEET_DANHGIA = "DuLieuDanhGia";
 const SHEET_LOGIN   = "LichSuDangNhap";
@@ -103,7 +104,7 @@ const ROUTES = {
 // ĐIỂM VÀO WEB APP
 // ============================================================
 function doGet() {
-  return json_({ success: true, data: { service: "VC-NLD API", time: new Date().toISOString() } });
+  return json_({ success: true, data: { service: "VC-NLD API", version: API_VERSION, time: new Date().toISOString() } });
 }
 
 function doPost(e) {
@@ -571,6 +572,7 @@ function ensureLoginHeader_(sheet) {
   const ck = "loginhdr_" + LOGIN_HEADERS.length;
   if (cache.get(ck)) return;
   cache.put(ck, "1", 6 * 60 * 60);
+  ensureSize_(sheet, 0, LOGIN_HEADERS.length);
   const range = sheet.getRange(1, 1, 1, LOGIN_HEADERS.length);
   const cur = range.getValues()[0].map(str_);
   if (cur.join("|") === LOGIN_HEADERS.join("|")) return;
@@ -668,6 +670,7 @@ function getV2Sheet_(create) {
   let sh = ss.getSheetByName(SHEET_DANHGIA_V2);
   if (!sh && create) {
     sh = ss.insertSheet(SHEET_DANHGIA_V2);
+    ensureSize_(sh, 0, V2_TOTAL_COLS);
     sh.getRange(1, 1, 1, V2_TOTAL_COLS).setValues([V2_HEADERS])
       .setBackground("#0f2557").setFontColor("white").setFontWeight("bold").setWrap(true);
     sh.setFrozenRows(1);
@@ -775,6 +778,7 @@ function saveDataV2_(form, user, month) {
     row[V2COL.LYDO]       = g.reasons.join("; ");
 
     const newRow = sheet.getLastRow() + 1;
+    ensureSize_(sheet, newRow, V2_TOTAL_COLS);
     sheet.getRange(newRow, V2COL.THANG + 1, 1, 2).setNumberFormat("@");
     sheet.getRange(newRow, 1, 1, V2_TOTAL_COLS).setValues([row]);
     SpreadsheetApp.flush();
@@ -796,6 +800,7 @@ function listV2_(month, donVi) {
  */
 function writeBlock_(sheet, writes, col, width) {
   writes = writes.slice().sort((a, b) => a.row - b.row);
+  ensureSize_(sheet, 0, col + width - 1);
   for (let i = 0; i < writes.length;) {
     let j = i;
     while (j + 1 < writes.length && writes[j + 1].row - writes[j].row <= 25) j++;
@@ -932,6 +937,7 @@ function saveData_(args, user) {
 
     const newRow = sheet.getLastRow() + 1;
     // Ép plain text TRƯỚC khi ghi để Sheets không tự đổi "09-2026" / MSNV thành số, ngày
+    ensureSize_(sheet, newRow, TOTAL_COLS);
     sheet.getRange(newRow, COL.THANGDANHGIA + 1).setNumberFormat("@");
     sheet.getRange(newRow, COL.MSNV + 1).setNumberFormat("@");
     sheet.getRange(newRow, 1, 1, TOTAL_COLS).setValues([row]);
@@ -1105,6 +1111,7 @@ function buildReportSheet_(month) {
   const rows = v2 ? data.map(reportRowV2_)
                   : data.map((it, idx) => [idx + 1, it.hoTen, it.donVi].concat(it.chiTiet, [it.sepDiem, it.sepLoai, it.sepGhiChu]));
   const w = headers.length;
+  ensureSize_(report, rows.length + 1, w);
   report.getRange(1, 1, 1, w).setValues([headers])
         .setBackground("#0f2557").setFontColor("white").setFontWeight("bold");
   report.getRange(2, 1, rows.length, w).setValues(rows)
@@ -1184,7 +1191,7 @@ function exportCSVData_(args) {
     lines.push(row.map(escape).join(","));
   });
 
-  const csv = "\uFEFF" + lines.join("\r\n");
+  const csv = "\uFEFF" + lines.join("\r\n") + "\r\n";
   return {
     base64: Utilities.base64Encode(Utilities.newBlob(csv, "text/csv").getBytes()),
     fileName: "BaoCao_" + month + ".csv",
@@ -1266,7 +1273,7 @@ function checkProxyKey_(key) {
 /** Số dòng (1-based) có ô ở cột `col` (0-based) khớp `text` */
 function findRows_(sheet, col, text, exact) {
   const last = sheet.getLastRow();
-  if (last < 2 || !str_(text)) return [];
+  if (last < 2 || !str_(text) || col + 1 > sheet.getLastColumn()) return [];
   let tf = sheet.getRange(2, col + 1, last - 1, 1).createTextFinder(String(text));
   if (exact !== false) tf = tf.matchEntireCell(true);
   return tf.findAll().map(c => c.getRow());
@@ -1275,14 +1282,17 @@ function findRows_(sheet, col, text, exact) {
 function readRows_(sheet, rows, width) {
   rows = Array.from(new Set(rows)).sort((a, b) => a - b);
   const out = [];
+  if (!rows.length) return out;
+  const w = Math.min(width, sheet.getMaxColumns());
+  const pad = r => { while (r.length < width) r.push(""); return r; };
   for (let i = 0; i < rows.length;) {
     let j = i;
     while (j + 1 < rows.length && rows[j + 1] - rows[j] <= 25) j++;
     const start = rows[i], end = rows[j];
     const want = {};
     rows.slice(i, j + 1).forEach(r => { want[r] = true; });
-    sheet.getRange(start, 1, end - start + 1, width).getValues()
-      .forEach((r, k) => { if (want[start + k]) out.push({ row: start + k, r: r }); });
+    sheet.getRange(start, 1, end - start + 1, w).getValues()
+      .forEach((r, k) => { if (want[start + k]) out.push({ row: start + k, r: pad(r) }); });
     i = j + 1;
   }
   return out;
@@ -1312,6 +1322,16 @@ function userRowsV1_(sheet, user) {
   return readRows_(sheet, rows, TOTAL_COLS).filter(x => rowOwnedBy_(x.r, user));
 }
 
+/**
+ * Đảm bảo sheet đủ số dòng/cột trước khi ghi. Sheet mới của Google chỉ có 1000 dòng × 26 cột,
+ * ghi vượt quá sẽ báo "outside the dimensions of the sheet".
+ */
+function ensureSize_(sheet, rows, cols) {
+  const mr = sheet.getMaxRows(), mc = sheet.getMaxColumns();
+  if (rows && rows > mr) sheet.insertRowsAfter(mr, rows - mr + 200);   // thêm dư 200 dòng
+  if (cols && cols > mc) sheet.insertColumnsAfter(mc, cols - mc);
+}
+
 // Script properties: đọc 1 lần cho mỗi yêu cầu
 let PROPS_CACHE_ = null;
 function prop_(k) {
@@ -1323,6 +1343,7 @@ function prop_(k) {
 // HELPERS
 // ============================================================
 function json_(obj) {
+  obj.v = API_VERSION;
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
 }
 

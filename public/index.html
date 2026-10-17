@@ -622,7 +622,7 @@
 
     <footer>
       <p><b>PHIẾU TỰ ĐÁNH GIÁ HIỆU QUẢ CÔNG VIỆC TRỰC TUYẾN</b></p>
-      <p>© 2026 Phòng Tổ chức cán bộ · <span style="opacity:.6;">phiên bản 2026.10.15</span></p>
+      <p>© 2026 Phòng Tổ chức cán bộ · <span style="opacity:.6;">phiên bản 2026.10.17</span></p>
     </footer>
   </div>
 </div>
@@ -671,7 +671,7 @@ const PAGE_LABELS = {
   'page-hr-detail':    { title:'Chi tiết đơn vị', sub:'Danh sách VC-NLĐ theo đơn vị' }
 };
 
-const APP_VERSION = '2026.10.15';
+const APP_VERSION = '2026.10.17';
 window.addEventListener('error', ev => showErrBanner(ev.message));
 window.addEventListener('unhandledrejection', ev => showErrBanner(ev.reason && ev.reason.message ? ev.reason.message : String(ev.reason)));
 function showErrBanner(msg) {
@@ -721,6 +721,42 @@ function setBusy(btn, busy, busyText) {
 function setStatus(el, cls, html) { el.className = 'status-msg' + (cls ? ' ' + cls : ''); el.innerHTML = html || ''; }
 function showError(err) { if (!err || !err.handled) alert('⚠️ ' + (err && err.message ? err.message : err)); }
 
+// ------------------------------------------------------------
+// Kiểm tra dữ liệu máy chủ trả về + phiên bản Apps Script
+// ------------------------------------------------------------
+const API_REQUIRED = '2026.10.17';       // Code.gs phải có API_VERSION ≥ số này
+const isUser = u => !!u && typeof u === 'object' && typeof u.hoTen === 'string' && typeof u.role === 'string';
+const SHAPE = {
+  login:      d => !!d && (d.multiUnit ? Array.isArray(d.donViList) : d.otpRequired ? !!d.otpId : (!!d.token && isUser(d.user))),
+  verifyOtp:  d => !!d && !!d.token && isUser(d.user),
+  switchUnit: d => !!d && !!d.token && isUser(d.user),
+  resendOtp:  d => !!d && typeof d.expiresIn === 'number',
+  checkDoubleEntry: d => typeof d === 'boolean',
+  saveData:   d => !!d && d.grade !== undefined,
+  getUserHistory: Array.isArray,
+  getStaffData:   Array.isArray,
+  getAllStaffData: Array.isArray,
+  updateManagerEvaluations: d => !!d && typeof d.saved === 'number',
+  getExportTCCB: d => !!d && Array.isArray(d.rows),
+  exportReport:  d => !!d && !!d.sheetName,
+  exportCSVData: d => !!d && !!d.base64,
+  exportExcelData: d => !!d && !!d.base64
+};
+let apiVerWarned = false;
+function checkApiVersion(v) {
+  if (apiVerWarned || (v && String(v) >= API_REQUIRED)) return;
+  apiVerWarned = true;
+  let b = document.getElementById('ver-banner');
+  if (!b) {
+    b = document.createElement('div');
+    b.id = 'ver-banner';
+    b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:100001;background:#fef3c7;color:#92400e;border-bottom:1px solid #fcd34d;padding:8px 14px;font-size:12.5px;text-align:center;';
+    document.body.appendChild(b);
+  }
+  b.textContent = `⚠️ Apps Script của trang này đang chạy bản cũ (${v ? 'phiên bản ' + v : 'chưa có số phiên bản'}; cần ≥ ${API_REQUIRED}). ` +
+                  'Quản trị viên vui lòng dán Code.gs mới vào Apps Script và tạo Phiên bản mới. Một số chức năng có thể không chạy đúng.';
+}
+
 async function api(action, args) {
   let res;
   try {
@@ -735,6 +771,8 @@ async function api(action, args) {
   let j;
   try { j = await res.json(); }
   catch (e) { throw new Error('Máy chủ phản hồi không hợp lệ (HTTP ' + res.status + ').'); }
+  if (!j || typeof j !== 'object') throw new Error('Máy chủ phản hồi không hợp lệ.');
+  checkApiVersion(j.v);
   if (!j.success) {
     const err = new Error(j.message || 'Lỗi không xác định');
     err.code = j.code;
@@ -745,7 +783,44 @@ async function api(action, args) {
     }
     throw err;
   }
+  const ok = SHAPE[action];
+  if (ok && !ok(j.data)) {
+    console.warn('Dữ liệu không đúng dạng cho', action, j.data);
+    const err = new Error(action === 'saveData'
+      ? 'Máy chủ phản hồi không đúng dạng sau khi gửi phiếu. Phiếu có thể ĐÃ được lưu — vui lòng xem mục "Kết quả & lịch sử" trước khi gửi lại. Nếu lỗi lặp lại, báo Phòng TCCB cập nhật Apps Script.'
+      : `Máy chủ trả dữ liệu không đúng dạng cho thao tác "${action}". Có thể Apps Script của trang này chưa được cập nhật cùng phiên bản giao diện — vui lòng báo Phòng TCCB.`);
+    err.code = 'SHAPE';
+    throw err;
+  }
   return j.data;
+}
+
+/** Sau khi gửi phiếu: hiện kết quả; lỗi giao diện ở bước này không được che mất việc đã lưu */
+function afterSaved(month, res, resetFn) {
+  try { markSubmitted(month, res.score, res.grade); } catch (e) { cache.history = null; }
+  try {
+    document.getElementById('res-score').textContent = res.score;
+    document.getElementById('res-grade').textContent = res.grade;
+    document.getElementById('res-month').textContent = monthLabel(month);
+    document.getElementById('success-result').classList.remove('hidden');
+    resetFn();
+    resetMonthPicker('mp-home');
+    setStatus(document.getElementById('status-msg'), '', '');
+    document.getElementById('btn-start').classList.add('hidden');
+  } catch (e) { console.error(e); }
+  showPage('page-success');
+}
+/** Lỗi khi gửi phiếu: gửi trùng / phản hồi lạ → đưa về lịch sử để người dùng tự kiểm tra */
+function onSaveError(e, resetFn) {
+  showError(e);
+  if (e && (e.code === 'DUPLICATE' || e.code === 'SHAPE')) {
+    cache.history = null; cache.historyAt = 0;
+    try { resetFn(); } catch (x) {}
+    document.getElementById('success-result').classList.add('hidden');
+    showPage('page-success');
+    return true;
+  }
+  return false;
 }
 
 function downloadBase64(b64, fileName, mime) {
@@ -1187,6 +1262,11 @@ function getHistory(force) {
   if (fresh && !force) return Promise.resolve(cache.history);
   if (cache.historyP && !force) return cache.historyP;
   const p = api('getUserHistory').then(d => {
+    if (!Array.isArray(d)) {
+      console.warn('getUserHistory trả về dữ liệu không phải danh sách:', d);
+      if (cache.historyP === p) cache.historyP = null;
+      throw new Error('Dữ liệu lịch sử không hợp lệ');
+    }
     if (cache.historyP === p) { cache.history = d; cache.historyAt = Date.now(); cache.historyP = null; }
     return d;
   }, e => { if (cache.historyP === p) cache.historyP = null; throw e; });
@@ -1194,7 +1274,7 @@ function getHistory(force) {
   return p;
 }
 function markSubmitted(month, score, grade) {
-  if (!cache.history) return;
+  if (!Array.isArray(cache.history)) { cache.history = null; cache.historyAt = 0; return; }
   cache.history = [{ thang: month, donVi: state.user.donVi, tongDiem: score, xepLoai: grade, sepLoai: '' }]
     .concat(cache.history.filter(r => !(r.thang === month && r.donVi === state.user.donVi)));
   cache.historyAt = Date.now();
@@ -1360,19 +1440,9 @@ async function submitData() {
   btns.forEach(b => setBusy(b, true, '⏳ Đang gửi...'));
   try {
     const res = await api('saveData', { form });
-    markSubmitted(form.assessmentMonth, res.score, res.grade);
-    document.getElementById('res-score').textContent = res.score;
-    document.getElementById('res-grade').textContent = res.grade;
-    document.getElementById('res-month').textContent = monthLabel(form.assessmentMonth);
-    document.getElementById('success-result').classList.remove('hidden');
-    resetForm();
-    resetMonthPicker('mp-home');
-    setStatus(document.getElementById('status-msg'), '', '');
-    document.getElementById('btn-start').classList.add('hidden');
-    showPage('page-success');
+    afterSaved(form.assessmentMonth, res, resetForm);
   } catch (e) {
-    showError(e);
-    btns.forEach(b => setBusy(b, false));
+    if (!onSaveError(e, resetForm)) btns.forEach(b => setBusy(b, false));
   }
 }
 
@@ -1700,19 +1770,9 @@ async function submitDataV2() {
   setBusy(btn, true, '⏳ Đang gửi...');
   try {
     const res = await api('saveData', { form });
-    markSubmitted(state.v2Month, res.score, res.grade);
-    document.getElementById('res-score').textContent = res.score;
-    document.getElementById('res-grade').textContent = res.grade;
-    document.getElementById('res-month').textContent = monthLabel(state.v2Month);
-    document.getElementById('success-result').classList.remove('hidden');
-    resetFormV2();
-    resetMonthPicker('mp-home');
-    setStatus(document.getElementById('status-msg'), '', '');
-    document.getElementById('btn-start').classList.add('hidden');
-    showPage('page-success');
+    afterSaved(state.v2Month, res, resetFormV2);
   } catch (e) {
-    showError(e);
-    setBusy(btn, false);
+    if (!onSaveError(e, resetFormV2)) setBusy(btn, false);
   }
 }
 
@@ -1721,6 +1781,7 @@ async function submitDataV2() {
 // ============================================================
 function renderHistory(data) {
   const wrap = document.getElementById('history-table-wrap');
+  if (!Array.isArray(data)) data = [];
   if (!data.length) { wrap.innerHTML = '<div class="empty-state">Chưa có lịch sử đánh giá nào.</div>'; return; }
   wrap.innerHTML = `<div class="table-wrap"><table class="history-table">
     <thead><tr><th>Tháng</th><th>Đơn vị</th><th>Tổng điểm</th><th>Tự xếp loại</th><th>Trưởng ĐV xếp loại</th></tr></thead>
