@@ -74,26 +74,27 @@ git push -u origin main
 
 Từ đó mỗi lần `git push` lên nhánh `main`, Cloudflare tự triển khai lại. `wrangler.toml` có `keep_vars = true` nên các biến đặt trên dashboard không bị xóa khi deploy.
 
-### Nhiều Worker dùng chung MỘT repo (khuyên dùng)
+### Nhiều Worker — mỗi Worker một thư mục
 
-Không cần nhân bản repo cho từng Worker. Tất cả Worker nối vào **cùng repo này**, chỉ khác *Deploy command*:
+Mỗi Worker nối vào thư mục riêng của nó trên GitHub; mọi thư mục có **cùng code**, chỉ khác `wrangler.toml`:
 
-| Worker | Deploy command |
-|---|---|
-| `danhgia` (chính) | `npx wrangler deploy` |
-| `ktthu` | `npx wrangler deploy --env ktthu` |
-| `ttgdyh` | `npx wrangler deploy --env ttgdyh` |
+- **Worker con** (`ttgdyh`, `tv`, …): `name = "<tên Worker>"` và `[triggers] crons = []` — **không có lịch riêng**.
+- **Worker `tccb`** (chính): là Worker **duy nhất có lịch**, kèm các khối `[[services]] WARM_<tên>` trỏ tới từng Worker con.
 
-Thêm Worker mới tên `abc`:
-1. Thêm 2 dòng vào cuối `wrangler.toml` rồi push:
+Lý do: gói Cloudflare miễn phí chỉ cho **5 lịch (Cron) cho cả tài khoản**; 25 Worker mỗi cái một lịch sẽ deploy lỗi. Nay cứ 5 phút trong giờ làm việc, `tccb` đánh thức Apps Script của mình **và của mọi Worker con** (kết nối nội bộ Cloudflare, không mở ra Internet). Một Worker con lỗi hay chưa tồn tại không làm hỏng việc đánh thức các Worker khác.
+
+**Cập nhật code:** chép `apps-script/`, `public/`, `src/`, `README.md` vào thư mục của từng Worker. `wrangler.toml` của mỗi thư mục chỉ cần thay một lần (bản trong gói tải về đã đúng tên).
+
+**Thêm Worker mới tên `abc`:**
+1. Tạo Worker `abc` trên Cloudflare, nối vào thư mục `abc` (Deploy command mặc định `npx wrangler deploy`). Thư mục `abc` dùng `wrangler.toml` của một Worker con, sửa `name = "abc"`.
+2. Đặt `APPS_SCRIPT_URL` (link Web App của bản sao Google Sheet tương ứng) và `PROXY_KEY` cho Worker `abc`.
+3. Trong `wrangler.toml` của **tccb**, thêm:
    ```toml
-   [env.abc]
-   name = "abc"
+   [[services]]
+   binding = "WARM_abc"
+   service = "abc"
+   entrypoint = "Warm"
    ```
-2. Trên Cloudflare: Worker `abc` → **Settings → Build → Git repository**: nối vào repo này; *Deploy command* = `npx wrangler deploy --env abc`.
-3. Đặt `APPS_SCRIPT_URL` (link Web App của bản sao Google Sheet tương ứng) và `PROXY_KEY` riêng cho Worker `abc`.
-
-Mỗi lần sửa code chỉ cần push **một lần** → mọi Worker tự build lại. Mỗi Worker vẫn dùng Google Sheet/Apps Script riêng qua biến của nó.
 
 > ⚠️ Riêng `Code.gs` thì **mỗi bản sao Google Sheet phải dán lại và Deploy → New version** (Apps Script không tự cập nhật theo GitHub). Nếu quên, giao diện hiện **dải vàng "Apps Script của bản này là bản cũ"** ở đầu trang để biết ngay bản nào chưa cập nhật.
 
@@ -140,7 +141,7 @@ Trang **Dashboard** của HR có nút **🏛️ Bảng tổng hợp chi thu nh�
 
 - **Đọc ít dữ liệu:** backend dùng *TextFinder* của Sheets để tìm đúng dòng cần (theo MSNV, theo tháng) thay vì đọc cả sheet — đăng nhập, kiểm tra đã nộp, lịch sử, bảng Trưởng đơn vị, dashboard HR đều chỉ đọc phần liên quan. Lưu bảng chấm ghi một lần cho cả nhóm dòng.
 - **Ít lần gọi máy chủ:** sau đăng nhập trang tải trước lịch sử cá nhân → chọn tháng hiện kết quả ngay; Trưởng đơn vị chọn tháng là dữ liệu đơn vị được tải trước, bảng chấm và thống kê dùng chung.
-- **Giữ Apps Script "ấm":** `wrangler.toml` có `[triggers] crons` — Cloudflare gọi nhẹ Apps Script 5 phút/lần trong 7h–19h (giờ VN) để tránh phải chờ Google khởi động lại. Có thể chỉnh giờ trong `crons` (giờ UTC).
+- **Giữ Apps Script "ấm":** Worker `tccb` có `[triggers] crons` — 5 phút/lần trong 7h–19h (giờ VN) gọi nhẹ Apps Script của cả 25 đơn vị để tránh phải chờ Google khởi động lại. Có thể chỉnh giờ trong `crons` (giờ UTC).
 - Phần chậm còn lại chủ yếu là thời gian Google chạy Apps Script (~1–2 giây/lần) và gửi email OTP (~1–2 giây) — không rút ngắn thêm được bằng code.
 
 ## Đăng nhập 2 lớp (OTP qua email) cho Trưởng đơn vị & HR
@@ -205,7 +206,9 @@ Mỗi lần đăng nhập, sai mã, gửi/gửi lại OTP, sai OTP… đều đ�
 | Thông báo | Cách xử lý |
 |---|---|
 | *Máy chủ chưa cấu hình APPS_SCRIPT_URL / PROXY_KEY* | Thêm biến ở Worker → Settings → Variables and Secrets |
-| Build báo tên Worker không khớp | Sửa `name` trong `wrangler.toml` cho trùng tên Worker trên dashboard |
+| Build báo tên Worker không khớp | Sửa `name` trong `wrangler.toml` của thư mục đó cho trùng tên Worker trên dashboard |
+| Build của `tccb` báo lỗi service binding | Một tên trong các khối `WARM_` chưa có Worker trên Cloudflare — tạo Worker đó trước, hoặc xóa khối `WARM_` của nó |
+| Build báo vượt giới hạn Cron (*exceeded … cron triggers*) | Worker con nào đó còn `wrangler.toml` cũ có lịch — thay bằng bản có `crons = []` |
 | *Máy chủ chưa cấu hình PROXY_KEY (Script properties)* | Thêm `PROXY_KEY` ở Apps Script (Bước 1.4) |
 | *Không có quyền truy cập* | `PROXY_KEY` hai bên chưa trùng nhau |
 | *Apps Script không trả về JSON* | Sai URL Web App, hoặc chưa đặt *Who has access = Anyone* |
