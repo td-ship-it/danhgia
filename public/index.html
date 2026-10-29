@@ -757,21 +757,30 @@ function checkApiVersion(v) {
                   'Quản trị viên vui lòng dán Code.gs mới vào Apps Script và tạo Phiên bản mới. Một số chức năng có thể không chạy đúng.';
 }
 
+const API_TIMEOUT_MS = 90 * 1000;
+function apiError(message, code) { const e = new Error(message); e.code = code; return e; }
+
 async function api(action, args) {
   let res;
+  const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = ctl ? setTimeout(() => ctl.abort(), API_TIMEOUT_MS) : null;
   try {
     res = await fetch(API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action, args: args || {}, token: state.token })
+      body: JSON.stringify({ action, args: args || {}, token: state.token }),
+      signal: ctl ? ctl.signal : undefined
     });
   } catch (e) {
-    throw new Error('Không kết nối được máy chủ. Vui lòng kiểm tra mạng và thử lại.');
+    clearTimeout(timer);
+    if (e && e.name === 'AbortError') throw apiError('Máy chủ phản hồi quá lâu. Vui lòng thử lại sau ít phút.', 'TIMEOUT');
+    throw apiError('Không kết nối được máy chủ. Vui lòng kiểm tra mạng và thử lại.', 'NETWORK');
   }
   let j;
   try { j = await res.json(); }
-  catch (e) { throw new Error('Máy chủ phản hồi không hợp lệ (HTTP ' + res.status + ').'); }
-  if (!j || typeof j !== 'object') throw new Error('Máy chủ phản hồi không hợp lệ.');
+  catch (e) { clearTimeout(timer); throw apiError('Máy chủ phản hồi không hợp lệ (HTTP ' + res.status + '). Vui lòng thử lại.', 'UPSTREAM'); }
+  clearTimeout(timer);
+  if (!j || typeof j !== 'object') throw apiError('Máy chủ phản hồi không hợp lệ. Vui lòng thử lại.', 'UPSTREAM');
   checkApiVersion(j.v);
   if (!j.success) {
     const err = new Error(j.message || 'Lỗi không xác định');
@@ -811,7 +820,19 @@ function afterSaved(month, res, resetFn) {
   showPage('page-success');
 }
 /** Lỗi khi gửi phiếu: gửi trùng / phản hồi lạ → đưa về lịch sử để người dùng tự kiểm tra */
-function onSaveError(e, resetFn) {
+async function onSaveError(e, resetFn, month) {
+  // Lỗi đường truyền / quá thời gian / phản hồi lỗi: phiếu có thể ĐÃ được lưu → kiểm tra lịch sử
+  if (month && e && ['TIMEOUT', 'NETWORK', 'UPSTREAM', 'BUSY'].indexOf(e.code) >= 0) {
+    try {
+      const hist = await getHistory(true);
+      const row = Array.isArray(hist) ? hist.find(r => r.thang === month) : null;
+      if (row) {
+        afterSaved(month, { score: row.tongDiem, grade: row.xepLoai }, resetFn);
+        alert('✅ Phiếu tháng ' + monthLabel(month) + ' đã được ghi nhận trên hệ thống.');
+        return true;
+      }
+    } catch (_) { /* rơi xuống báo lỗi gốc */ }
+  }
   showError(e);
   if (e && (e.code === 'DUPLICATE' || e.code === 'SHAPE')) {
     cache.history = null; cache.historyAt = 0;
@@ -1442,7 +1463,7 @@ async function submitData() {
     const res = await api('saveData', { form });
     afterSaved(form.assessmentMonth, res, resetForm);
   } catch (e) {
-    if (!onSaveError(e, resetForm)) btns.forEach(b => setBusy(b, false));
+    if (!(await onSaveError(e, resetForm, form.assessmentMonth))) btns.forEach(b => setBusy(b, false));
   }
 }
 
@@ -1772,7 +1793,7 @@ async function submitDataV2() {
     const res = await api('saveData', { form });
     afterSaved(state.v2Month, res, resetFormV2);
   } catch (e) {
-    if (!onSaveError(e, resetFormV2)) setBusy(btn, false);
+    if (!(await onSaveError(e, resetFormV2, state.v2Month))) setBusy(btn, false);
   }
 }
 
